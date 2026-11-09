@@ -1,4 +1,8 @@
 name: probe
-on:/n  workflow_dispatch:/n  push:/n    branches: [ probe ]
-jobs:/n  p:/n    runs-on: ubuntu-latest
-    steps:/n      - run: uname -a; echo hello
+on:
+  workflow_dispatch:
+jobs:
+  p:
+    runs-on: ubuntu-latest
+    steps:
+      - run: uname -a; echo hello
