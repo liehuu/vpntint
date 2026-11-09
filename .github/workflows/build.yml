@@ -26,6 +26,7 @@ jobs:
           git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
           echo "THEOS=$THEOS" >> "$GITHUB_ENV"
           echo "$THEOS/bin" >> "$GITHUB_PATH"
+          echo "$THEOS/toolchain/linux/iphone/bin" >> "$GITHUB_PATH"
 
           mkdir -p "$THEOS/toolchain"
           curl -sL --retry 3 -o /tmp/tc.tar.xz \
@@ -47,12 +48,16 @@ jobs:
           "$THEOS/bin/install-sdk" latest
           ls "$THEOS/sdks"
 
-      - name: 打印环境（排错用）
+      - name: 打印环境（排错用，全部容错，不影响结论）
         run: |
           echo "THEOS=$THEOS"
-          "$THEOS/toolchain/linux/iphone/bin/clang" --version | head -3
-          which dpkg-deb ldid lipo fakeroot make
-          ldid -h 2>&1 | head -3 || true
+          "$THEOS/toolchain/linux/iphone/bin/clang" --version | head -3 || true
+          for t in dpkg-deb fakeroot make ldid lipo ld64; do
+            p=$(command -v "$t" 2>/dev/null || echo "-")
+            echo "tool $t -> $p"
+          done
+          ls "$THEOS/toolchain/linux/iphone/bin" | tr '\n' ' '; echo
+          echo "PATH=$PATH"
 
       - name: Build rootless (iphoneos-arm64)
         run: |
@@ -96,17 +101,14 @@ jobs:
             find /tmp/x -type f | sed 's|/tmp/x||'
             echo "--- 控制脚本 ---"
             ls -l /tmp/ctl
-            echo "--- dylib 架构 ---"
-            find /tmp/x -name 'VpnTint.dylib' -exec lipo -detailed_info {} \; | grep -E 'architecture|subtype|Non-fat|fat file'
+            echo "--- dylib 架构（直接解析 Mach-O 头）---"
+            dylib=$(find /tmp/x -name 'VpnTint.dylib' | head -1)
+            echo "$dylib"
+            python3 tools/check_arch.py "$dylib"
             echo "--- filter plist ---"
             python3 -c "import plistlib,glob,sys; p=glob.glob('/tmp/x/**/VpnTint.plist',recursive=True)[0]; d=plistlib.load(open(p,'rb')); print('Filter:', d); assert 'com.apple.springboard' in d['Filter']['Bundles']"
           done
-          dylib=$(find /tmp/x -name 'VpnTint.dylib' | head -1)
-          archs=$(lipo -archs "$dylib")
-          echo "dylib archs: $archs"
-          echo "$archs" | tr ' ' '\n' | grep -qx arm64
-          echo "$archs" | tr ' ' '\n' | grep -qx arm64e
-          echo "OK: 双切片齐全"
+          echo "OK: 两个包都通过校验"
 
       - uses: actions/upload-artifact@v4
         with:
