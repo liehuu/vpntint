@@ -64,15 +64,13 @@ print(cf.strip())
 arch = [l for l in cf.splitlines() if l.startswith("Architecture:")][0].split(":", 1)[1].strip()
 print("Architecture =", arch)
 
-pi = "./postinst" if "./postinst" in names else ("postinst" if "postinst" in names else None)
-assert pi, "缺 postinst"
-info = ctl.getmember(pi)
-print("postinst mode = 0o%o (可执行=%s)" % (info.mode, bool(info.mode & 0o111)))
-assert info.mode & 0o111, "postinst 没有可执行位"
-body = ctl.extractfile(pi).read()
-print("postinst 首行:", body.splitlines()[0])
-assert body.startswith(b"#!/bin/sh\n"), "postinst shebang 或换行符不对（应为 LF）"
-assert b"\r\n" not in body, "postinst 含 CRLF，设备上会执行失败"
+# 1.0.1 起：包里不允许出现任何 maintainer script。
+# 原因：postinst 里 respring / killall SpringBoard 会把前台的 Sileo 一起杀掉，
+# dpkg 停在 configure 一半，下次开 Sileo 就是「dpkg 被中断」。
+scripts = [n for n in names
+           if n.lstrip("./") not in ("", "control", "md5sums", "conffiles", "triggers", "shlibs")]
+assert not scripts, "包内不应带 maintainer script，实际有: %s" % scripts
+print("OK: 包内无 maintainer script（不存在打断 dpkg 的 respring 钩子）")
 
 dat = open_tar(dat_body)
 

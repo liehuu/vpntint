@@ -135,7 +135,10 @@ jobs:
           name: vpntint-debs
           path: out/*.deb
 
+      # 发布只由手动 dispatch 触发；普通 push 只做构建+校验，
+      # 避免每次改代码都把已发布资产重新打包（字节会变，用户手上的哈希就失效）
       - uses: softprops/action-gh-release@v2
+        if: github.event_name == 'workflow_dispatch'
         with:
           tag_name: v1.0.1
           name: VpnTint 1.0.1（修复安装后台 dpkg 被中断）
