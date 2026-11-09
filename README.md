@@ -76,3 +76,21 @@ export THEOS=~/theos
 make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless   # iphoneos-arm64
 make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide   # iphoneos-arm64e
 ```
+
+## 已验证 / 未验证
+
+对着产物验过的（`tools/check_arch.py`、`tools/verify_deb.py`，读原始字节）：
+
+- dylib 双切片：arm64 cpusubtype `0x00000000`，arm64e `0x00000002`（掩码 `0x00FFFFFF` 后比较），非单切片 thin
+- `LC_BUILD_VERSION` platform=iOS / minos 15.0 / sdk 16.5，`LC_CODE_SIGNATURE` 存在
+- 已链接 `CFNetwork.framework`，`CFNetworkCopySystemProxySettings` 不是悬空符号
+- Filter 只含 `com.apple.springboard`；roothide 包路径为 `Library/...`（无 `/var/jb`），rootless 为 `var/jb/...`
+- `postinst` 权限 0755、shebang 为 LF（无 CRLF）
+- Release 资产匿名下载回来比 sha256，与 GitHub 记录的 digest 一致
+
+**没有实机，所以下面两条只能装上后看日志确认**：
+
+- iOS 17 上状态栏私有视图的实际命中情况 —— 判据是日志里出现 `首次上色命中：<类名>`；
+  没出现但日志有「已加载」，说明这条 hook 链全没命中，需要按日志里的 `补hook子类=` 数字继续查
+- iCloud 专用代理（Private Relay）会不会被误判成 VPN
+

@@ -83,13 +83,13 @@ def norm(n):
     return n.lstrip("/")
 
 
-dnames = [(norm(m.name), m.mode) for m in dat.getmembers() if m.isfile()]
+dnames = [(norm(m.name), m.mode, m.name) for m in dat.getmembers() if m.isfile()]
 print("--- 包内文件 ---")
-for n, m in dnames:
+for n, m, _raw in dnames:
     print("  0o%o %s" % (m, n))
 
-dylib = [n for n, _ in dnames if n.endswith(".dylib")]
-plist = [n for n, _ in dnames if n.endswith(".plist")]
+dylib = [n for n, _, _r in dnames if n.endswith(".dylib")]
+plist = [n for n, _, _r in dnames if n.endswith(".plist")]
 assert len(dylib) == 1 and len(plist) == 1, "dylib/plist 数量不对"
 
 if arch == "iphoneos-arm64":
@@ -102,6 +102,7 @@ else:
 os.makedirs("/tmp/debx", exist_ok=True)
 out = "/tmp/debx/VpnTint.dylib"
 with open(out, "wb") as f:
-    f.write(dat.extractfile(dylib[0]).read())
+    raw_name = [r for n, _m, r in dnames if n == dylib[0]][0]
+    f.write(dat.extractfile(raw_name).read())
 print("已导出 dylib ->", out)
 print("OK: 包结构校验通过")
