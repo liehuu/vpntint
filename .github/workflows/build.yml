@@ -14,21 +14,45 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Theos (官方安装脚本，非交互)
+      - name: 安装依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential fakeroot rsync curl perl zip git xz-utils libtinfo6 libssl-dev dpkg
+          sudo update-alternatives --set fakeroot /usr/bin/fakeroot-sysv || true
+
+      - name: 安装 Theos + LLVM 工具链 + SDK（手动，不用官方脚本以免 libxml2 依赖炸掉）
         run: |
           export THEOS="$HOME/theos"
-          export CI=1
-          bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)"
-          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
-          echo "$HOME/theos/bin" >> "$GITHUB_PATH"
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+          echo "$THEOS/bin" >> "$GITHUB_PATH"
+
+          mkdir -p "$THEOS/toolchain"
+          curl -sL --retry 3 -o /tmp/tc.tar.xz \
+            https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz
+          ls -l /tmp/tc.tar.xz
+          tar -xJf /tmp/tc.tar.xz -C "$THEOS/toolchain"
+
+          ls "$THEOS/toolchain/linux/iphone/bin" | head -30
+
+          # ldid：工具链里没有就单独下 Procursus 的 Linux 版
+          if [ ! -x "$THEOS/toolchain/linux/iphone/bin/ldid" ]; then
+            curl -sL --retry 3 -o /tmp/ldid \
+              https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_linux_x86_64
+            chmod +x /tmp/ldid
+            cp /tmp/ldid "$THEOS/bin/ldid"
+            cp /tmp/ldid "$THEOS/toolchain/linux/iphone/bin/ldid"
+          fi
+
+          "$THEOS/bin/install-sdk" latest
+          ls "$THEOS/sdks"
 
       - name: 打印环境（排错用）
         run: |
           echo "THEOS=$THEOS"
-          ls "$THEOS/toolchain/linux/iphone/bin" | head
-          ls "$THEOS/sdks"
           "$THEOS/toolchain/linux/iphone/bin/clang" --version | head -3
-          which dpkg-deb ldid fakeroot make
+          which dpkg-deb ldid lipo fakeroot make
+          ldid -h 2>&1 | head -3 || true
 
       - name: Build rootless (iphoneos-arm64)
         run: |
@@ -59,28 +83,30 @@ jobs:
           ls -l packages/
           cp packages/*.deb out/vpntint-roothide.deb
 
-      - name: Verify packages
+      - name: 校验产物
         run: |
           set -e
           for f in out/*.deb; do
             echo "========== $f"
             dpkg-deb -I "$f"
-            rm -rf /tmp/x && mkdir -p /tmp/x
+            rm -rf /tmp/x /tmp/ctl && mkdir -p /tmp/x /tmp/ctl
             dpkg-deb -x "$f" /tmp/x
+            dpkg-deb -e "$f" /tmp/ctl
             echo "--- 包内文件 ---"
             find /tmp/x -type f | sed 's|/tmp/x||'
+            echo "--- 控制脚本 ---"
+            ls -l /tmp/ctl
             echo "--- dylib 架构 ---"
             find /tmp/x -name 'VpnTint.dylib' -exec lipo -detailed_info {} \; | grep -E 'architecture|subtype|Non-fat|fat file'
             echo "--- filter plist ---"
-            find /tmp/x -name 'VpnTint.plist' -exec plutil -lint {} \;
-            echo "--- postinst 可执行位 ---"
-            ls -l /tmp/x/DEBIAN/postinst 2>/dev/null || true
+            python3 -c "import plistlib,glob,sys; p=glob.glob('/tmp/x/**/VpnTint.plist',recursive=True)[0]; d=plistlib.load(open(p,'rb')); print('Filter:', d); assert 'com.apple.springboard' in d['Filter']['Bundles']"
           done
           dylib=$(find /tmp/x -name 'VpnTint.dylib' | head -1)
           archs=$(lipo -archs "$dylib")
           echo "dylib archs: $archs"
           echo "$archs" | tr ' ' '\n' | grep -qx arm64
           echo "$archs" | tr ' ' '\n' | grep -qx arm64e
+          echo "OK: 双切片齐全"
 
       - uses: actions/upload-artifact@v4
         with:
