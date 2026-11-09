@@ -1,0 +1,10 @@
+Package: com.liehuu.vpntint
+Name: VpnTint
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: VPN 连接时把状态栏 Wi-Fi 图标 / 蜂窝信号与 4G-5G 字样变成橙色，断开后恢复默认颜色。
+Homepage: https://github.com/liehuu/vpntint
+Maintainer: liehuu
+Author: liehuu
+Section: Tweaks
+Depends: mobilesubstrate, firmware (>= 15.0)

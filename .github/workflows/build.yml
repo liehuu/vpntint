@@ -1,0 +1,97 @@
+name: build
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          brew install ldid xz dpkg || brew install ldid xz || true
+          echo "--- tool check ---"
+          which ldid || true
+          which dpkg-deb || true
+          which xz || true
+
+      - name: Setup Theos
+        run: |
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$HOME/theos"
+          mkdir -p "$HOME/theos/sdks"
+          curl -fsSL https://github.com/theos/sdks/archive/refs/heads/master.tar.gz -o /tmp/sdks.tar.gz
+          tar -xzf /tmp/sdks.tar.gz -C "$HOME/theos/sdks" --strip-components=1
+          echo "--- sdks ---"
+          ls "$HOME/theos/sdks"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+
+      - name: Build rootless (iphoneos-arm64)
+        run: |
+          make clean >/dev/null 2>&1 || true
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
+          mkdir -p out
+          ls -l packages/
+          cp packages/*.deb "out/vpntint-rootless.deb"
+
+      - name: Build roothide (iphoneos-arm64e)
+        run: |
+          make clean >/dev/null 2>&1 || true
+          rm -rf packages
+          if make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide; then
+            echo "roothide scheme 构建成功"
+          else
+            echo "roothide scheme 不可用，改用 rootful 布局 + 改 Architecture"
+            make clean >/dev/null 2>&1 || true
+            make package FINALPACKAGE=1
+            f=$(ls packages/*.deb | head -1)
+            rm -rf /tmp/rp && mkdir -p /tmp/rp
+            dpkg-deb -R "$f" /tmp/rp
+            perl -pi -e 's/^Architecture:.*$/Architecture: iphoneos-arm64e/' /tmp/rp/DEBIAN/control
+            dpkg-deb -b /tmp/rp packages/vpntint-roothide.deb
+          fi
+          cp packages/*.deb "out/vpntint-roothide.deb"
+
+      - name: Verify packages
+        run: |
+          for f in out/*.deb; do
+            echo "========== $f"
+            dpkg-deb -I "$f"
+            rm -rf /tmp/x && mkdir -p /tmp/x
+            dpkg-deb -x "$f" /tmp/x
+            echo "--- files ---"
+            find /tmp/x -type f | sed 's|/tmp/x||'
+            echo "--- dylib arch ---"
+            find /tmp/x -name '*.dylib' -exec lipo -detailed_info {} \; | grep -E 'architecture|subtype|Non-fat|fat file'
+            echo "--- filter plist ---"
+            find /tmp/x -name 'VpnTint.plist' -exec plutil -lint {} \;
+          done
+          # 双切片是硬要求：arm64 + arm64e 缺一个就失败
+          find /tmp/x -name 'VpnTint.dylib' | head -1 > /tmp/dylib.path
+          n=$(lipo -archs "$(cat /tmp/dylib.path)" | tr ' ' '\n' | grep -c -E '^(arm64|arm64e)$')
+          archs=$(lipo -archs "$(cat /tmp/dylib.path)")
+          echo "dylib archs: $archs"
+          echo "$archs" | grep -qw arm64
+          echo "$archs" | grep -qw arm64e
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vpntint-debs
+          path: out/*.deb
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.0
+          name: VpnTint 1.0.0
+          body: |
+            VPN 连接时状态栏 Wi-Fi 图标 / 蜂窝信号 / 4G-5G 字样变橙色，断开恢复默认色。
+
+            - `vpntint-rootless.deb`：Dopamine / palera1n rootless（/var/jb）
+            - `vpntint-roothide.deb`：RootHide / roothide bootstrap（iphoneos-arm64e）
+          files: out/*.deb
