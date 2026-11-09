@@ -13,7 +13,51 @@ VPN 连接时把状态栏的 **Wi-Fi 图标 / 蜂窝信号 / 4G-5G 字样** 染�
 | Dopamine / palera1n rootless（有 `/var/jb`） | `vpntint-rootless.deb` |
 | RootHide / roothide bootstrap（无 `/var/jb`） | `vpntint-roothide.deb` |
 
-用 Sileo / Zebra / Filza 安装，postinst 会自动 respring；没自动重启就手动 respring 一次。
+用 Sileo / Zebra / Filza 安装，**装完手动点一次 respring**。
+包里故意不带 postinst —— 原因见下面「为什么包里不带 postinst」。
+
+## 为什么包里不带 postinst（1.0.1 起）
+
+1.0.0 的 `postinst` 里有一句 `killall -9 SpringBoard`，装完确实自动重启了桌面，代价是：
+
+1. dpkg 在 **configure 阶段同步执行** postinst，这时 Sileo 正在前台持有这次安装会话；
+2. `killall -9` 是 SIGKILL 硬杀 SpringBoard，Sileo 作为 SpringBoard 托管的 App 被一起杀掉，
+   安装会话被掐断，dpkg 停在「已解包、未配置」；
+3. roothide / RootHide 下 SpringBoard 被 -9 后要重新注入 jailbreak 环境，这一步不干净就是
+   SpringBoard 崩溃循环 → 只能硬重启，dpkg 数据库彻底停在 configure 中间；
+4. 下次打开 Sileo，检测到 dpkg 状态不一致 → 报「dpkg 被中断」。
+
+所以 1.0.1 起：
+
+- 包内**不带任何 maintainer script**，respring 交给包管理器或用户；
+- CI 加了硬断言 `tools/check_scripts.sh`：maintainer script 里出现
+  `killall / sbreload / respring / launchctl / SpringBoard` 直接构建失败；
+- 这个断言有**反向自检**（先喂一个含 `killall -9 SpringBoard` 的假 postinst，必须被拦下才算检查有效），
+  不会退化成永远通过的装饰；
+- 另外显式断言包里不存在 `postinst`。
+
+## 已经踩到「dpkg 被中断」怎么恢复
+
+装 1.0.0 后遇到的，按这个顺序处理（roothide / RootHide，NewTerm 里 `su` 到 root，默认密码 `alpine`）：
+
+```sh
+# 1. 看有没有残留的 dpkg 进程，有就先等它自己结束
+ps -A | grep dpkg
+
+# 2. 把没走完的 configure 收尾（Sileo 里那个「修复」按钮本质就是这条）
+dpkg --configure -a
+
+# 3. 如果报 lock 被占用：确认第 1 步没有 dpkg 进程后再删锁
+rm -f /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend
+
+# 4. 如果 vpntint 卡在 half-configured，强制移除
+dpkg --remove --force-remove-reinstreq com.liehuu.vpntint
+
+# 5. 再装 1.0.1（这一版没有任何 postinst，不会再碰 SpringBoard）
+```
+
+在 NewTerm 这类已经注入越狱环境的 App 里，`/var/lib/dpkg` 会被自动重定向到 jbroot 内的真实路径，
+不用手写 `.jbroot-<HASH>` 长路径。若 `dpkg` 命令找不到，用 `$(jbroot)/usr/bin/dpkg` 代替。
 
 ## 工作原理
 
@@ -85,7 +129,7 @@ make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide   # iphoneos-arm64e
 - `LC_BUILD_VERSION` platform=iOS / minos 15.0 / sdk 16.5，`LC_CODE_SIGNATURE` 存在
 - 已链接 `CFNetwork.framework`，`CFNetworkCopySystemProxySettings` 不是悬空符号
 - Filter 只含 `com.apple.springboard`；roothide 包路径为 `Library/...`（无 `/var/jb`），rootless 为 `var/jb/...`
-- `postinst` 权限 0755、shebang 为 LF（无 CRLF）
+- 包内无 `postinst` / 任何 maintainer script（`tools/check_scripts.sh`，自带反向自检）
 - Release 资产匿名下载回来比 sha256，与 GitHub 记录的 digest 一致
 
 **没有实机，所以下面两条只能装上后看日志确认**：

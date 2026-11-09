@@ -96,6 +96,14 @@ jobs:
       - name: 校验产物
         run: |
           set -e
+          # 反向自检：先确认检查脚本真的会失败，否则下面那条断言就是装饰
+          rm -rf /tmp/selftest && mkdir -p /tmp/selftest
+          printf '#!/bin/sh\nkillall -9 SpringBoard\n' > /tmp/selftest/postinst
+          if sh tools/check_scripts.sh /tmp/selftest; then
+            echo "FAIL: 自检脚本没拦住 killall SpringBoard，检查本身失效"
+            exit 1
+          fi
+          echo "OK: 自检能拦住重启桌面动作"
           for f in out/*.deb; do
             echo "========== $f"
             dpkg-deb -I "$f"
@@ -112,6 +120,13 @@ jobs:
             python3 tools/check_arch.py "$dylib"
             echo "--- filter plist ---"
             python3 -c "import plistlib,glob,sys; p=glob.glob('/tmp/x/**/VpnTint.plist',recursive=True)[0]; d=plistlib.load(open(p,'rb')); print('Filter:', d); assert 'com.apple.springboard' in d['Filter']['Bundles']"
+            echo "--- maintainer scripts（不许重启桌面，否则 dpkg 会中断）---"
+            sh tools/check_scripts.sh /tmp/ctl
+            if ls /tmp/ctl | grep -qx postinst; then
+              echo "FAIL: 包里又出现 postinst，1.0.1 起禁止带 maintainer script"
+              exit 1
+            fi
+            echo "OK: 无 postinst"
           done
           echo "OK: 两个包都通过校验"
 
@@ -122,10 +137,15 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.0
-          name: VpnTint 1.0.0
+          tag_name: v1.0.1
+          name: VpnTint 1.0.1（修复安装后台 dpkg 被中断）
           body: |
             VPN 连接时状态栏 Wi-Fi 图标 / 蜂窝信号 / 4G-5G 字样变橙色，断开恢复默认色。
+
+            **1.0.1 修复**：删掉了 postinst 里的 `killall -9 SpringBoard`。
+            上一版它会硬杀 SpringBoard，连带杀掉前台的 Sileo，dpkg 停在 configure 一半，
+            下次打开 Sileo 就报「dpkg 被中断」。从这版起包内不带任何 maintainer script，
+            装完请手动点一下 respring。
 
             - `vpntint-rootless.deb`：Dopamine / palera1n rootless（有 /var/jb）
             - `vpntint-roothide.deb`：RootHide / roothide bootstrap（iphoneos-arm64e）
