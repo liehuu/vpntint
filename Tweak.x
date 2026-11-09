@@ -370,7 +370,21 @@ static void VTDiscoverFallback(void) {
     @try {
         if (!gItemViews) gItemViews = [NSHashTable weakObjectsHashTable];
         NSMutableArray *out = [NSMutableArray array];
-        for (UIWindow *w in [[UIApplication sharedApplication] windows]) VTScanView(w, 0, out);
+        NSMutableArray<UIWindow *> *wins = [NSMutableArray array];
+        UIApplication *app = [UIApplication sharedApplication];
+        if ([app respondsToSelector:@selector(connectedScenes)]) {
+            for (UIScene *sc in app.connectedScenes) {
+                if ([sc isKindOfClass:[UIWindowScene class]]) {
+                    [wins addObjectsFromArray:((UIWindowScene *)sc).windows];
+                }
+            }
+        }
+        if (wins.count == 0) {
+            // KVC 取旧属性，绕开 iOS 15 起的弃用告警（-Werror 下会直接编译失败）
+            id legacy = [app valueForKey:@"windows"];
+            if ([legacy isKindOfClass:[NSArray class]]) [wins addObjectsFromArray:legacy];
+        }
+        for (UIWindow *w in wins) VTScanView(w, 0, out);
         for (UIView *v in out) [gItemViews addObject:v];
         if (out.count) {
             gDidLogFirstTint = NO;
@@ -440,12 +454,12 @@ static int VTInstallRuntimeHooks(const char *baseName) {
 
 - (void)applyStyleAttributes:(id)attributes {
     %orig;
-    @try { VTHandleItemView(self); } @catch (NSException *e) { }
+    @try { VTHandleItemView((UIView *)self); } @catch (NSException *e) { }
 }
 
 - (void)layoutSubviews {
     %orig;
-    @try { VTHandleItemView(self); } @catch (NSException *e) { }
+    @try { VTHandleItemView((UIView *)self); } @catch (NSException *e) { }
 }
 
 %end
