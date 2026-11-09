@@ -174,6 +174,21 @@ static VTKind VTKindForView(UIView *v) {
     VTKind k = VTKindFromClassName(c);
     if (k != VTKindNone) return k;
 
+    // 「4G / 5G」那个字最可靠的判据其实是文本本身：运营商制式字符串是有限集合
+    if ([v isKindOfClass:[UILabel class]]) {
+        NSString *t = [(UILabel *)v text];
+        if (t.length > 0 && t.length <= 6) {
+            static NSSet *typeTexts = nil;
+            if (!typeTexts) {
+                typeTexts = [NSSet setWithArray:@[@"5G", @"5G+", @"5G⁺", @"5G UW", @"5G UC",
+                                                  @"5G E", @"5GE", @"LTE", @"4G", @"4G+",
+                                                  @"3G", @"2G", @"E", @"GPRS", @"1X", @"UMTS",
+                                                  @"HSPA", @"HSPA+", @"NR"]];
+            }
+            if ([typeTexts containsObject:[t uppercaseString]]) return VTKindCellular;
+        }
+    }
+
     const char *cn = class_getName(c);
 
     // 次级判据：item 的 identifier（wifi / cellular / cellular.type ...）
@@ -478,15 +493,25 @@ static void VTStartTimer(void) {
     dispatch_source_set_event_handler(gTimer, ^{
         @try {
             if (!gEnabled) return;
+
+            // 摘掉已经从层级里消失的旧视图（respring / 状态栏重建后不会再有 superview）
+            BOOL pruned = NO;
+            if (gItemViews.count > 0) {
+                for (UIView *v in gItemViews.allObjects) {
+                    if (!v.superview) { [gItemViews removeObject:v]; pruned = YES; }
+                }
+            }
+
             BOOL on = VTDetectVPN();
             if (on != gVPNOn) {
                 gVPNOn = on;
-                VTLog(@"VPN 状态 -> %@", on ? @"已连接" : @"已断开");
+                VTLog(@"VPN 状态 -> %@（已登记视图 %lu 个）", on ? @"已连接" : @"已断开",
+                      (unsigned long)gItemViews.count);
                 VTApplyAll(on);
                 if (on && gItemViews.count == 0) VTDiscoverFallback();
             } else if (on) {
-                VTApplyAll(YES);                    // 幂等重刷，压住框架自己的重置
-                if (gItemViews.count == 0) VTDiscoverFallback();
+                VTApplyAll(YES);                                    // 幂等重刷，压住框架自己的重置
+                if (gItemViews.count == 0 || pruned) VTDiscoverFallback();
             }
         } @catch (NSException *e) { }
     });
