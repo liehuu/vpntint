@@ -251,6 +251,17 @@ def run_checks(raw, quiet=False):
         "CFNetworkCopySystemProxySettings" in code,
         "缺代理设置兜底：数据层 hook 万一再失配就彻底没救")
 
+    # ---------- 10. 不许用 @available ----------
+    # 实测：本工程工具链（clang-11）里 @available 会编成对 ___isOSVersionAtLeast 的
+    # 引用，该符号在其 libSystem 里不存在 → 链接阶段 Undefined symbols，构建挂掉。
+    # 编译是过的，只在 Linking 崩，很容易误判成语法错误而白找一轮。
+    av = re.findall(r"@available\s*\(", code)
+    chk("不使用 @available（工具链缺 ___isOSVersionAtLeast，链接会失败）",
+        not av, "出现 %d 处 @available，改用 NSProcessInfo 版本比较" % len(av))
+    chk("用 NSProcessInfo 判断系统版本",
+        "isOperatingSystemAtLeastVersion" in code,
+        "缺版本判断，iOS 17 / iOS 16 两套 hook 无法分流")
+
     return list(oks), list(fails)
 
 
@@ -279,6 +290,10 @@ def selftest(raw, path):
         ("断开不还原",
          raw.replace("VTRestoreAsync();\n    }", "/* no restore */\n    }", 1),
          "断开"),
+        ("换回 @available（工具链缺 ___isOSVersionAtLeast，链接必挂）",
+         raw.replace("BOOL is17 = VTIsIOS17OrLater();",
+                     "BOOL is17 = NO; if (@available(iOS 17, *)) is17 = YES;"),
+         "@available"),
     ]
 
     QUIET = True

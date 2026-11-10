@@ -959,6 +959,27 @@ static int VTInstall16(void) {
     return n;
 }
 
+/// 版本号判断。**不能用 `@available(iOS 17, *)`**。
+///
+/// 实测：本工程用的 LLVM 工具链（L1ghtmann/llvm-project，clang-11）里，
+/// `@available` 会编成对 `___isOSVersionAtLeast` 的引用，而这个符号在它自带的
+/// libSystem 里不存在 → 链接阶段 `Undefined symbols for architecture arm64`，
+/// 构建直接挂在 Linking 那一步（编译本身是过的，很容易误判成语法错误）。
+///
+/// 这里换成 NSProcessInfo 的比较，纯 ObjC 运行时，不引入任何新符号。
+static BOOL VTIsIOS17OrLater(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        @try {
+            NSOperatingSystemVersion want = {17, 0, 0};
+            cached = [[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion:want] ? 1 : 0;
+        } @catch (NSException *e) {
+            cached = 0;
+        }
+    }
+    return cached == 1;
+}
+
 __attribute__((constructor))
 static void VTInitialize(void) {
     @autoreleasepool {
@@ -969,8 +990,7 @@ static void VTInitialize(void) {
                 return;
             }
 
-            BOOL is17 = NO;
-            if (@available(iOS 17, *)) is17 = YES;
+            BOOL is17 = VTIsIOS17OrLater();
 
             // ★ StatusStatusUI 是 iOS 17 状态栏的新私有框架。SpringBoard 启动早期
             //   它可能还没加载，此时 objc_getClass 拿不到 STUIStatusBar*，必须
