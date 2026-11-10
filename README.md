@@ -177,15 +177,26 @@ GitHub Actions 自动出双架构包（arm64 + arm64e，分两次编译后 fat�
 
 两道闸门（都在 CI 里跑，且每条判据都做过反向自检）：
 
-- `tools/check_source.py` —— 源码级 23 项，钉住这次的教训：hook 目标必须是
+- `tools/check_source.py` —— 源码级 **25 项**，钉住这次的教训：hook 目标必须是
   `STUIStatusBar*`、必须 hook `setActiveColor:` / `setInactiveColor:`、不得出现
   `colorWithAlphaComponent`、`VTKeepAlpha` 必须用原 alpha、闸门必须会开、断开必须还原、
-  每个 hook 必须链式调回原实现。带 `--selftest`：逐一破坏 5 条关键机制，
-  确认每条判据**真的会失败**（不做这步，闸门可能就是永远通过的装饰）。
-- `tools/check_arch.py` / `tools/verify_deb.py` / `tools/check_scripts.sh` —— 产物级：
-  双切片、包结构、无 maintainer script。
-- CI 还断言 dylib 里**必须含** `STUIStatusBar` 等 hook 目标字符串、**不得含**
-  `_UIStatusBarItemView` —— 防「源码改对了但产物没变」这类假修复。
+  每个 hook 必须链式调回原实现。带 `--selftest`：逐一破坏 **6 条**关键机制
+  （砍 STUIStatusBar / 砍 vpnEntry / 引入 colorWithAlphaComponent / 删 `gReady = 1` /
+  断开不还原 / 换回 `@available`），确认每条判据**真的会失败**
+  （不做这步，闸门可能就是永远通过的装饰）。
+- `tools/verify_release.py` —— 产物级 **11 项**，直接读 deb 原始字节（自己解 ar + tar，
+  不依赖 dpkg）：首成员 debian-binary、Version 与仓库根 `control` 一致、无任何
+  maintainer script、dylib 与 plist 各 1 个、路径前缀与 Architecture 匹配
+  （rootless 带 `var/jb/`，roothide 纯 `Library/`）、dylib 可执行位、filter plist 挂
+  `com.apple.springboard`、arm64 + arm64e 双切片、7 个 hook 目标字符串齐全、
+  且不含 `_UIStatusBarItemView` —— 防「源码改对了但产物没变」这类假修复。
+  带 `--selftest`：对真实 deb 逐条投毒 **9 条**（另加「清空 dylib」共 10 条），
+  先证明断言会失败，再判通过。
+- `tools/check_scripts.sh` —— 独立的 maintainer script 扫描（自带反向自检）。
+
+`data.tar.zst` 的解压是三级兜底：内置 `compression.zstd`（Python 3.14+）→
+`zstandard` 模块（必须用 `stream_reader`，dpkg 的帧不带 content size）→ `zstd` 命令。
+三条路都失败时会把各自的原因一起打出来，不会把「库缺失」误报成「包坏了」。
 
 本地构建：
 
@@ -196,9 +207,24 @@ make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide   # iphoneos-arm64e
 python3 tools/check_source.py --selftest && python3 tools/check_source.py
 ```
 
+## 下载校验
+
+v1.0.2 两个包的 sha256（等于 GitHub Release 记录的 digest，已下载回来比过）：
+
+| 包 | 大小 | sha256 |
+|---|---|---|
+| `vpntint-roothide.deb` | 22916 B | `96a508d7e960289b5256b62cf46214218c705e54b6cb08303ef06f0016ebf6d5` |
+| `vpntint-rootless.deb` | 20620 B | `163c3f537a8da9133f5bf4e12595c1efaf9ecd05812e9bed7618a4def859cdb6` |
+
+自己核一遍：设备上用 `sha256sum`，电脑上用 `shasum -a 256` 或
+`certutil -hashfile <文件> SHA256`。
+
+注意：CI 每次重编译的字节可能不同（tar 里带时间戳），所以**以 Release 上的文件为准**，
+不要拿本地构建出来的包去对这张表。
+
 ## 已验证 / 未验证
 
-对着产物验过的（`tools/check_arch.py`、`tools/verify_deb.py`，读原始字节）：
+对着产物验过的（`tools/verify_release.py`，读 deb 原始字节）：
 
 - dylib 双切片：arm64 cpusubtype `0x00000000`，arm64e `0x00000002`（掩码 `0x00FFFFFF` 后比较），非单切片 thin
 - `LC_BUILD_VERSION` platform=iOS / minos 15.0 / sdk 16.5，`LC_CODE_SIGNATURE` 存在
