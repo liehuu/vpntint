@@ -330,6 +330,28 @@ def run_checks(raw, quiet=False):
         rs is not None and "objc_msgSend" in rs,
         "VTRestoreSlot 里仍在直调 methodForSelector 拿到的 IMP")
 
+    # ---------- 8c. 观测手段本身必须可验证（1.0.3 实机事故）----------
+    # 用户装 1.0.3 仍进安全模式且「完全找不到 VpnTint.log」。两条原因：
+    # ① VTLog 只写 /var/mobile/Library/Logs 与 /tmp，SpringBoard 沙箱可能都写不进去，
+    #    gLogPath=nil 后所有日志静默丢弃；② 首条日志排在所有 hook 安装之后，
+    #    崩在初始化段时用户看到的就是「崩了 + 零日志」，无法定位。
+    # 「没日志」不等于「没发生」——先把观测建起来，再谈根因。
+    ctor = body_of(nc, "static void VTConstructor")
+    chk("dylib 加载后立即打点（首条日志在任何 hook 之前）",
+        ctor is not None and "[0/7]" in ctor,
+        "constructor 没有先打点：崩在初始化段时用户拿不到任何证据")
+    steps = re.findall(r'VTLog\(@"\[(\d)/7\]', nc)
+    chk("初始化分步打点齐全（0..7）",
+        sorted(set(steps)) == list("01234567"),
+        "缺分步打点：崩在哪一步只能靠猜（实测 %s）" % sorted(set(steps)))
+    chk("日志同时进系统 os_log（NSLog 兜底）",
+        'NSLog(@"VpnTint: %@", msg);' in nc,
+        "只写文件：沙箱写不进去时所有日志静默丢失")
+    chk("日志路径有试写探针与沙箱 home 候选",
+        "NSHomeDirectory()" in nc and
+        "probe = [NSFileHandle fileHandleForWritingAtPath:p]" in nc,
+        "缺可写性验证：fileExists / 目录建成功都不等于能写文件")
+
     # ---------- 9. VPN 判定双源（数据层为主，代理设置为兜底） ----------
     chk("VPN 判定读 vpnEntry",
         "vpnEntry" in nc, "没有读 vpnEntry，状态判定会只剩代理设置兜底")
@@ -457,6 +479,20 @@ def selftest(raw, path):
         ("去掉 HookLevel=0 无害降级",
          raw.replace("if (gHookLevel <= 0) {", "if (0) {"),
          "HookLevel=0"),
+        ("砍掉 constructor 的加载打点（回到崩了也零日志）",
+         raw.replace('VTLog(@"[0/7] dylib 已加载，constructor 进入主队列");',
+                     "/* no load log */"),
+         "加载后立即打点"),
+        ("砍掉一个分步打点",
+         raw.replace('VTLog(@"[5/7] hook 记录完成 %d 条，准备统一替换 IMP", hooks);\n', ""),
+         "分步打点齐全"),
+        ("去掉 NSLog 兜底（回到只写文件）",
+         raw.replace('NSLog(@"VpnTint: %@", msg);   // 系统日志兜底：不依赖任何文件是否可写\n', ""),
+         "os_log"),
+        ("去掉日志试写探针",
+         raw.replace("probe = [NSFileHandle fileHandleForWritingAtPath:p]",
+                     "probe = nil"),
+         "试写探针"),
     ]
 
     QUIET = True

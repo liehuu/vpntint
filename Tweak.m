@@ -206,7 +206,18 @@ static NSString *gLogPath = nil;
 
 static void VTLogInit(void) {
     if (gLogPath) return;
-    NSArray *cands = @[@"/var/mobile/Library/Logs/VpnTint.log", @"/tmp/VpnTint.log"];
+    // SpringBoard 是沙箱进程：/var/mobile/Library/Logs/ 与 /tmp 都可能不可写。
+    // 进程自己的 home 一定可写，放第一位；每个候选都要**真的试开一次写句柄**，
+    // 「目录建出来了 / fileExists」都不等于能写。
+    NSMutableArray *cands = [NSMutableArray array];
+    NSString *home = NSHomeDirectory();
+    if (home) [cands addObject:[home stringByAppendingPathComponent:@"Documents/VpnTint.log"]];
+    [cands addObjectsFromArray:@[
+        @"/var/mobile/Library/Logs/VpnTint.log",
+        @"/var/mobile/Documents/VpnTint.log",
+        @"/var/mobile/Media/VpnTint.log",
+        @"/tmp/VpnTint.log",
+        @"/var/tmp/VpnTint.log"]];
     NSFileManager *fm = [NSFileManager defaultManager];
     for (NSString *p in cands) {
         @try {
@@ -215,12 +226,16 @@ static void VTLogInit(void) {
             if (![fm fileExistsAtPath:p]) {
                 [fm createFileAtPath:p contents:[NSData data] attributes:nil];
             }
+            NSFileHandle *probe = [NSFileHandle fileHandleForWritingAtPath:p];
+            if (!probe) continue;              // 沙箱拒绝 → 换下一个
+            [probe closeFile];
             NSDictionary *attr = [fm attributesOfItemAtPath:p error:NULL];
             if ([attr[NSFileSize] unsignedLongLongValue] > 128 * 1024) {
                 [fm removeItemAtPath:p error:NULL];
                 [fm createFileAtPath:p contents:[NSData data] attributes:nil];
             }
-            if ([fm fileExistsAtPath:p]) { gLogPath = p; break; }
+            gLogPath = p;
+            break;
         } @catch (NSException *e) { continue; }
     }
 }
@@ -233,6 +248,7 @@ static void VTLog(NSString *fmt, ...) {
         va_start(ap, fmt);
         NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
         va_end(ap);
+        NSLog(@"VpnTint: %@", msg);   // 系统日志兜底：不依赖任何文件是否可写
         NSDateFormatter *df = [[NSDateFormatter alloc] init];
         df.dateFormat = @"MM-dd HH:mm:ss";
         NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [df stringFromDate:[NSDate date]], msg];
@@ -996,7 +1012,10 @@ static BOOL VTIsIOS17OrLater(void) {
 static void VTInitialize(void) {
     @autoreleasepool {
         @try {
+            VTLog(@"[1/7] 进入 VTInitialize，准备读配置");
             VTLoadPrefs();
+            VTLog(@"[2/7] 配置读完：level=%d enabled=%d logPath=%@",
+                  gHookLevel, gEnabled, gLogPath ?: @"(未定)");
             if (!gEnabled) {
                 VTLog(@"VpnTint %s：总开关关闭，直接退出", VT_VERSION);
                 return;
@@ -1009,6 +1028,7 @@ static void VTInitialize(void) {
                 return;
             }
 
+            VTLog(@"[3/7] 准备判断系统版本与 dlopen 私有框架");
             BOOL is17 = VTIsIOS17OrLater();
 
             // ★ StatusStatusUI 是 iOS 17 状态栏的新私有框架。SpringBoard 启动早期
@@ -1021,12 +1041,16 @@ static void VTInitialize(void) {
                 dloked = (h != NULL);
             }
 
+            VTLog(@"[4/7] dlopen 返回 %d，准备记录各 hook 的原 IMP", dloked ? 1 : 0);
             int hooks = is17 ? VTInstall17() : VTInstall16();
+            VTLog(@"[5/7] hook 记录完成 %d 条，准备统一替换 IMP", hooks);
             VTCommitHooks();   // 所有 orig 记录完毕后，才统一替换 IMP
+            VTLog(@"[6/7] IMP 替换完成，准备判定 VPN 状态");
 
             gVPNFromData = NO;
             gVPNFromCF   = gCFFallback ? VTDetectVPNByCFNetwork() : NO;
 
+            VTLog(@"[7/7] 初始化完成（到此未崩）");
             VTLog(@"VpnTint %s 已加载 | host=%@ | iOS%d | StatusStatusUI=%d | level=%d | hook=%d | VPN=%d(源=%@)",
                   VT_VERSION,
                   [[NSProcessInfo processInfo] processName],
@@ -1067,6 +1091,9 @@ static void VTConstructor(void) {
     //   这里只投递一个 block，真正的初始化放到主队列的第一个 turn。
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
+            // [0/7] 这一条只要出现，就证明 dylib 已被 SpringBoard 加载、
+            // constructor 执行过、主队列可用。崩在它之前 = 加载/签名层的问题。
+            VTLog(@"[0/7] dylib 已加载，constructor 进入主队列");
             @try { VTInitialize(); }
             @catch (NSException *e) { VTLog(@"初始化异常：%@", e); }
         }
