@@ -278,8 +278,16 @@ python3 tools/check_source.py --selftest && python3 tools/check_source.py
 ## 下载校验
 
 以 GitHub Release 上的文件为准：CI 每次重编译的字节可能不同（tar 里带时间戳），
-**不要拿本地构建出来的包去对哈希**。v1.0.3 的两个 sha256 在 Release 生成后更新到本表，
-并会做「Release 原文件 / Release 记录的 digest / 重新下载的文件」三端一致比对。
+**不要拿本地构建出来的包去对哈希**。已做「Release 原文件 / Release 记录的 digest /
+重新下载的文件（`?x=<ts>` 破 CDN）」三端一致比对，两个包又各跑了
+`verify_release.py` 的 11 项断言 + 10 条投毒，全过。
+
+Release：https://github.com/liehuu/vpntint/releases/tag/v1.0.3
+
+| 包 | 大小 | sha256 |
+|---|---|---|
+| `vpntint-roothide.deb` | 21882 B | `ba64bb5ec1f21b6ee529a66477075575a333b4a57307a4b5e563a8e6e39b637c` |
+| `vpntint-rootless.deb` | 19674 B | `8b4c02016b597fce17ab02ee271bbcf4fad6a0c6cb26b01d220139c59208dc2c` |
 
 自己核一遍：设备上用 `sha256sum`，电脑上用 `shasum -a 256` 或
 `certutil -hashfile <文件> SHA256`。
