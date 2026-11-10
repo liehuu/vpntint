@@ -64,6 +64,13 @@ jobs:
           ls "$THEOS/toolchain/linux/iphone/bin" | tr '\n' ' '; echo
           echo "PATH=$PATH"
 
+      - name: 源码闸门（钉住 iOS 17 的 hook 目标，反向自检先跑）
+        run: |
+          set -e
+          # 反向自检：先确认每条判据都能失败，否则下面的「全通过」是装饰
+          python3 tools/check_source.py --selftest
+          python3 tools/check_source.py
+
       - name: Build rootless (iphoneos-arm64)
         run: |
           make clean >/dev/null 2>&1 || true
@@ -127,6 +134,28 @@ jobs:
               exit 1
             fi
             echo "OK: 无 postinst"
+
+            echo "--- dylib 内必须含 iOS 17 hook 目标（源码对了但产物没变 = 假修复）---"
+            # 反向自检：确认 strings|grep 这条路真能查出东西，否则下面是装饰
+            if strings "$dylib" | grep -q 'STUIStatusBarItemView_NONEXISTENT'; then
+              echo "FAIL: 反向自检失效，grep 对任意串都命中"
+              exit 1
+            fi
+            for s in STUIStatusBar STUIStatusBarSignalView setActiveColor: setInactiveColor: vpnEntry StatusStatusUI; do
+              if strings "$dylib" | grep -qF "$s"; then
+                echo "  OK 产物含 $s"
+              else
+                echo "  FAIL 产物里没有 $s —— hook 目标没编进去"
+                exit 1
+              fi
+            done
+            # 反面：旧的错误目标不该再出现（_UIStatusBarSignalView 仍保留给 iOS16 分支，
+            # 只禁止 _UIStatusBarItemView 这个 1.0.1 的错误入口）
+            if strings "$dylib" | grep -qF '_UIStatusBarItemView'; then
+              echo "FAIL: 产物里还有 _UIStatusBarItemView（1.0.1 的错误 hook 目标）"
+              exit 1
+            fi
+            echo "OK: hook 目标正确"
           done
           echo "OK: 两个包都通过校验"
 
@@ -140,15 +169,27 @@ jobs:
       - uses: softprops/action-gh-release@v2
         if: github.event_name == 'workflow_dispatch'
         with:
-          tag_name: v1.0.1
-          name: VpnTint 1.0.1（修复安装后台 dpkg 被中断）
+          tag_name: v1.0.2
+          name: VpnTint 1.0.2（修复完全无效果：hook 了错误的私有类）
           body: |
             VPN 连接时状态栏 Wi-Fi 图标 / 蜂窝信号 / 4G-5G 字样变橙色，断开恢复默认色。
 
-            **1.0.1 修复**：删掉了 postinst 里的 `killall -9 SpringBoard`。
-            上一版它会硬杀 SpringBoard，连带杀掉前台的 Sileo，dpkg 停在 configure 一半，
-            下次打开 Sileo 就报「dpkg 被中断」。从这版起包内不带任何 maintainer script，
-            装完请手动点一下 respring。
+            **1.0.2 修复「装上完全没效果」**，两条根因：
+            1. **hook 目标类选错了。** iOS 17 起状态栏迁到私有框架
+               `StatusStatusUI.framework`，类名从 `_UIStatusBar*` 换成 `STUIStatusBar*`。
+               旧版 hook 的 `_UIStatusBarItemView` 在 iOS 17 上根本不会被实例化，
+               一个触发点都没有 —— 插件等于没装。现在改为 hook
+               `STUIStatusBar` 的数据更新方法、`STUIStatusBarStringView`、
+               `STUIStatusBarSignalView` 及其子类，并 dlopen 该框架确保启动早期也能取到类。
+            2. **染色方式选错了。** iOS 17 的信号视图是自绘的，颜色取自
+               `activeColor` / `inactiveColor`。旧版对它们写 `tintColor` 完全无效。
+               现在直接改这两个属性。
+
+            同时并入三条实机验证过的机制：启动 500ms 闸门（避免 respring 后图标空白）、
+            断开后主动写回原色（否则橙色残留）、未激活色保留原 alpha（否则图标看不见）。
+
+            装完请手动 respring。查询诊断日志：
+            `/var/mobile/Library/Logs/VpnTint.log`，启动行会打印每个 hook 点的安装条数。
 
             - `vpntint-rootless.deb`：Dopamine / palera1n rootless（有 /var/jb）
             - `vpntint-roothide.deb`：RootHide / roothide bootstrap（iphoneos-arm64e）
