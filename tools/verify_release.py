@@ -9,12 +9,12 @@
 结构：
   parse_deb() 只负责取字节，全部断言集中在 CHECKS 表里，对 ctx（解析结果）操作。
   这样 --selftest 可以拿真实 deb 的 ctx 逐项投毒，验证「每条断言真的会失败」——
-  否则「25 项全过」只是一排永远为真的装饰。
+  否则「全部通过」只是一排永远为真的装饰。
 
 用法:
   verify_release.py <deb> [<deb> ...]          校验
   verify_release.py --selftest <deb>           反向自检（投毒必须被抓到）
-  verify_release.py --version 1.0.2 <deb>      指定期望版本（默认 1.0.2）
+  verify_release.py --version 1.0.3 <deb>      指定期望版本（默认 1.0.3）
 """
 import hashlib
 import io
@@ -30,7 +30,7 @@ import tempfile
 
 CPU_ARM64 = 0x0100000C
 # 期望版本从仓库根的 control 读（单一真源），读不到才退回这个字面量。
-DEFAULT_VERSION = "1.0.2"
+DEFAULT_VERSION = "1.0.3"
 
 
 def version_from_control():

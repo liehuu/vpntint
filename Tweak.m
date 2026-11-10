@@ -38,12 +38,23 @@
 //      浅色壁纸 → 近乎全白，两种背景下都「看不见」，表现为图标消失。
 //      正确做法是只换 RGB，alpha 沿用原色。
 //
+//   ⑥ 1.0.2 装完直接进安全模式（SpringBoard 崩），根因在 hook 框架本身：
+//      · 同一个 repl 装到「基类 + 全部子类」，而原 IMP 表按
+//        object_getClass(self) 查 —— 子类 override 调 [super setActiveColor:] 时
+//        self 仍是子类实例，会查回子类自己的 orig，无限递归直到栈溢出。
+//        @try/@catch 拦不住 SIGSEGV。
+//      · objc_copyClassList 全量遍历、对大量私有类调 class_getInstanceMethod，
+//        在 constructor 阶段可能触发 +initialize，宿主尚未就绪就会崩。
+//      1.0.3：每个 (类,SEL) 用独立 trampoline 精确绑定自己的 orig（绝不按 self
+//      查表）、只 hook 具体类不 hook 基类、精确 objc_getClass 不做全量遍历、
+//      初始化延迟到主队列、再加一层递归深度保险。
+//
 // 工程约束：
 //   · 不用 Logos，入口是 __attribute__((constructor))，全部 hook 走 runtime。
 //     这样每个 hook 点都有 NULL 检查与返回值，不会因为某个类在某个系统版本
 //     上不存在而整组静默失败。
 //   · 热路径（applyStyleAttributes: 等）零 NSString 分配、零 IO、零日志。
-//     原 IMP 查找用静态 C 数组线性扫描（hook 点 < 64，指针比较）。
+//     原 IMP 按槽位直取，绝不做按 self 的继承链查找（那是 1.0.2 的递归根因）。
 //   · 包内不含任何 maintainer script（历史事故：postinst 里重启 SpringBoard
 //     打断 dpkg 配置流程 → Sileo 报「dpkg 被中断」）。
 // ============================================================================
@@ -59,7 +70,7 @@
 
 extern CFDictionaryRef CFNetworkCopySystemProxySettings(void);
 
-#define VT_VERSION   "1.0.2"
+#define VT_VERSION   "1.0.3"
 #define VT_PREF_PATH "/var/mobile/Library/Preferences/com.liehuu.vpntint.plist"
 #define VT_READY_MS  500
 
@@ -129,6 +140,10 @@ static BOOL      gCFFallback   = YES;   // 状态栏数据拿不到时用系统�
 static CGFloat   gPollInterval = 1.0;   // 兜底轮询间隔（秒）
 static UIColor  *gTintColor    = nil;   // 目标颜色
 static NSArray  *gIgnoreIfaces = nil;   // 不计入 VPN 的接口名前缀（例如 utun0）
+// 渐进开关（诊断用）：0=完全不装 hook 只写日志 / 1=仅数据层 / 2=+文字层 / 3=全部（默认）
+// 万一又进安全模式，把 HookLevel 设 0，插件就不碰任何系统方法，手机必定能正常开机；
+// 再逐级往上调，配合日志定位是哪一层出的问题，不用反复卸载重装。
+static int       gHookLevel    = 3;
 
 static UIColor *VTColorFromHex(NSString *hex) {
     if (![hex isKindOfClass:[NSString class]]) return nil;
@@ -150,6 +165,7 @@ static UIColor *VTColorFromHex(NSString *hex) {
 
 static void VTLoadPrefs(void) {
     gEnabled      = YES;
+    gHookLevel    = 3;
     gTintBars     = YES;
     gTintTypeText = YES;
     gCFFallback   = YES;
@@ -161,6 +177,10 @@ static void VTLoadPrefs(void) {
     if (![d isKindOfClass:[NSDictionary class]]) return;
 
     if (d[@"Enabled"])        gEnabled      = [d[@"Enabled"] boolValue];
+    if (d[@"HookLevel"]) {
+        int lv = [d[@"HookLevel"] intValue];
+        if (lv >= 0 && lv <= 3) gHookLevel = lv;
+    }
     if (d[@"TintSignalBars"]) gTintBars     = [d[@"TintSignalBars"] boolValue];
     if (d[@"TintTypeText"])   gTintTypeText = [d[@"TintTypeText"] boolValue];
     if (d[@"CFFallback"])     gCFFallback   = [d[@"CFFallback"] boolValue];
@@ -426,8 +446,7 @@ static void VTRestoreSlot(id view, NSString *setter, NSString *getter, UIColor *
                 } @catch (NSException *e) {}
             }
         }
-        IMP imp = [view methodForSelector:sel];
-        if (imp) ((void (*)(id, SEL, id))imp)(view, sel, color);
+        ((void (*)(id, SEL, id))objc_msgSend)(view, sel, color);
     } @catch (NSException *e) {}
 }
 
@@ -505,110 +524,184 @@ static void VTNoteTransition(void) {
 }
 
 // ============================================================================
-// hook 安装器（全部 runtime，零 Logos）
+// hook 框架（1.0.3 重写，修「装上就进安全模式」）
 //
-// 原 IMP 存静态 C 数组，链式调用时线性扫描 + 指针比较 —— 零 NSString 分配。
+// 1.0.2 的致命缺陷：同一个 repl 被装到「基类 + 全部子类」，而链式调用按
+//   实例的实际类沿继承链查原 IMP。子类 override 调 [super setActiveColor:]
+//   时 self 仍是子类实例，查回的是子类自己的 orig -> 无限递归 -> 栈溢出
+//   -> SpringBoard 崩 -> 安全模式。@try/@catch 拦不住 SIGSEGV。
+//
+// 修法（对齐 Logos %orig 的语义）：每个 (类, SEL) 分配一个独立 trampoline，
+// 槽位号编译期写死，原 IMP 从该槽位直接取，绝不按 self 的类查表。super 调用
+// 命中的是父类自己的 trampoline（另一个槽位），取的是父类的 orig，不会绕回子类。
+//
+// 另外三道保险：
+//   - __thread 递归深度：任何没预料到的重入都直接透传原实现，不进染色逻辑。
+//   - 只 hook 精确命名的具体类，不做全量类表遍历（启动早期遍历私有类会触发
+//     大量 +initialize，宿主尚未就绪时极易崩）。
+//   - 整个初始化延迟到主队列，避开 dyld 装载镜像的 constructor 阶段。
 // ============================================================================
 
+#define VT_MAX_HOOKS       24
+#define VT_MAX_CHAIN_DEPTH 4
+
+typedef enum {
+    VTKindDataAggregated = 1,
+    VTKindDataCompletion = 2,
+    VTKindStringStyle    = 3,
+    VTKindStringSetText  = 4,
+    VTKindSignalActive   = 5,
+    VTKindSignalInactive = 6,
+    VTKindSignalStyle    = 7,
+} VTHookKind;
+
 typedef struct {
-    Class cls;
-    SEL   sel;
-    IMP   orig;
+    Class       cls;
+    SEL         sel;
+    IMP         orig;     // 精确绑定：记录阶段该方法的系统原始实现
+    const char *types;    // 记录阶段取的类型编码，提交阶段不再查 runtime
+    VTHookKind  kind;
+    BOOL        twoArgs;
 } VTHookRec;
 
-static VTHookRec gHooks[64];
+static VTHookRec gHooks[VT_MAX_HOOKS];
 static int       gHookCount = 0;
+// 不用 __thread / TLS：越狱 dylib 里 TLS 变量依赖 dyld 的 TLV 支持，加载期就有风险。
+// 状态栏更新全在主线程，普通 volatile 计数足够；跨线程最坏只是少染一次色，不会崩。
+static volatile int gChainDepth = 0;
 
-static IMP VTFindOrig(Class c, SEL sel) {
-    while (c) {
-        for (int i = 0; i < gHookCount; i++) {
-            if (gHooks[i].cls == c && sel_isEqual(gHooks[i].sel, sel)) return gHooks[i].orig;
-        }
-        c = class_getSuperclass(c);
+static void VTInvoke(int idx, id self, SEL _cmd, id a1, id a2);
+static void VTCaptureVPNFromData(id data);
+
+/// 每个槽位一个独立 C 函数：槽位号写死在函数名里，原 IMP 不按 self 查找。
+#define VT_TRAMP(i) \
+static void VTTramp1_##i(id self, SEL _cmd, id a1) { VTInvoke(i, self, _cmd, a1, nil); } \
+static void VTTramp2_##i(id self, SEL _cmd, id a1, id a2) { VTInvoke(i, self, _cmd, a1, a2); }
+
+VT_TRAMP(0)  VT_TRAMP(1)  VT_TRAMP(2)  VT_TRAMP(3)  VT_TRAMP(4)  VT_TRAMP(5)
+VT_TRAMP(6)  VT_TRAMP(7)  VT_TRAMP(8)  VT_TRAMP(9)  VT_TRAMP(10) VT_TRAMP(11)
+VT_TRAMP(12) VT_TRAMP(13) VT_TRAMP(14) VT_TRAMP(15) VT_TRAMP(16) VT_TRAMP(17)
+VT_TRAMP(18) VT_TRAMP(19) VT_TRAMP(20) VT_TRAMP(21) VT_TRAMP(22) VT_TRAMP(23)
+
+#undef VT_TRAMP
+
+static IMP VTTrampolineFor(int idx, BOOL twoArgs) {
+#define VT_CASE(i) case i: return twoArgs ? (IMP)VTTramp2_##i : (IMP)VTTramp1_##i;
+    switch (idx) {
+        VT_CASE(0)  VT_CASE(1)  VT_CASE(2)  VT_CASE(3)  VT_CASE(4)  VT_CASE(5)
+        VT_CASE(6)  VT_CASE(7)  VT_CASE(8)  VT_CASE(9)  VT_CASE(10) VT_CASE(11)
+        VT_CASE(12) VT_CASE(13) VT_CASE(14) VT_CASE(15) VT_CASE(16) VT_CASE(17)
+        VT_CASE(18) VT_CASE(19) VT_CASE(20) VT_CASE(21) VT_CASE(22) VT_CASE(23)
+        default: return NULL;
     }
-    return NULL;
+#undef VT_CASE
 }
 
-static BOOL VTHookMethod(Class c, SEL sel, IMP repl) {
-    if (!c || !sel || !repl) return NO;
+/// 用槽位绑定的原 IMP 调回系统实现。绝不按 object_getClass(self) 查表。
+static void VTCallOrig(VTHookRec *r, id self, SEL _cmd, id a1, id a2) {
+    IMP imp = r ? r->orig : NULL;
+    if (!imp) return;
+    if (r->twoArgs) ((void (*)(id, SEL, id, id))imp)(self, _cmd, a1, a2);
+    else            ((void (*)(id, SEL, id))imp)(self, _cmd, a1);
+}
+
+/// 只「预约」一个 hook：记录系统原始 IMP 与类型编码，**不改任何方法**。
+///
+/// 关键：所有槽位的 orig 必须在任何 IMP 被替换之前全部记录完。若边记录边
+/// 替换，而两个被 hook 的类恰好有继承关系，后装的那个类用
+/// class_getInstanceMethod 会取到前一个已被换掉的 trampoline，orig 就指向
+/// 我们自己的 hook —— 轻则双重染色，重则又变成递归。分两阶段可结构性排除。
+static BOOL VTHookMethod(Class c, SEL sel, VTHookKind kind, BOOL twoArgs) {
+    if (!c || !sel) return NO;
     Method m = class_getInstanceMethod(c, sel);
     if (!m) return NO;
     IMP eff = method_getImplementation(m);
-    if (eff == repl) return NO;                       // 已装过，别自我递归
-    if (gHookCount >= 64) return NO;
-    gHooks[gHookCount].cls  = c;
-    gHooks[gHookCount].sel  = sel;
-    gHooks[gHookCount].orig = eff;
+    if (!eff) return NO;
+    if (gHookCount >= VT_MAX_HOOKS) return NO;
+    for (int i = 0; i < gHookCount; i++) {
+        if (gHooks[i].cls == c && sel_isEqual(gHooks[i].sel, sel)) return NO;
+    }
+    IMP repl = VTTrampolineFor(gHookCount, twoArgs);
+    if (!repl) return NO;
+    gHooks[gHookCount].cls     = c;
+    gHooks[gHookCount].sel     = sel;
+    gHooks[gHookCount].orig    = eff;
+    gHooks[gHookCount].types   = method_getTypeEncoding(m);
+    gHooks[gHookCount].kind    = kind;
+    gHooks[gHookCount].twoArgs = twoArgs;
     gHookCount++;
-    class_replaceMethod(c, sel, repl, method_getTypeEncoding(m));
     return YES;
 }
 
-/// 把 IMP 调回原实现。参数统一按 id 传，够用（本插件 hook 的点都是对象参数）。
-static void VTChain1(id self, SEL cmd, id a1) {
-    IMP imp = VTFindOrig(object_getClass(self), cmd);
-    if (imp) ((void (*)(id, SEL, id))imp)(self, cmd, a1);
+/// 统一提交：此时 gHooks[] 里的 orig 全部是未受污染的系统实现。
+static void VTCommitHooks(void) {
+    for (int i = 0; i < gHookCount; i++) {
+        VTHookRec *r = &gHooks[i];
+        IMP repl = VTTrampolineFor(i, r->twoArgs);
+        if (!repl || !r->cls || !r->sel || !r->types || !r->orig) continue;
+        class_replaceMethod(r->cls, r->sel, repl, r->types);
+    }
 }
 
-static void VTChain2(id self, SEL cmd, id a1, id a2) {
-    IMP imp = VTFindOrig(object_getClass(self), cmd);
-    if (imp) ((void (*)(id, SEL, id, id))imp)(self, cmd, a1, a2);
-}
-
-/// applyStyleAttributes: / setText: / setActiveColor: / setInactiveColor: 都不在
-/// 任何公开头里完整声明，直接写 @selector(...) 会触发 undeclared selector 告警，
-/// -Werror 下编译直接失败。一律走字符串转 SEL，只在安装阶段调用一次。
+/// 动态 SEL（避免 undeclared selector 在 -Werror 下失败）
 static SEL VTSelApplyStyle(void)  { return NSSelectorFromString(@"applyStyleAttributes:"); }
 static SEL VTSelSetText(void)     { return NSSelectorFromString(@"setText:"); }
 static SEL VTSelSetActive(void)   { return NSSelectorFromString(@"setActiveColor:"); }
 static SEL VTSelSetInactive(void) { return NSSelectorFromString(@"setInactiveColor:"); }
 
-/// 收集一个类及其全部子类（子类 override 后基类 hook 拦不到，必须逐个补）。
-static int VTCollectSubclasses(Class base, Class *out, int cap) {
-    if (!base || !out || cap <= 0) return 0;
-    out[0] = base;
-    int n = 1;
-    unsigned int total = 0;
-    Class *all = objc_copyClassList(&total);
-    if (!all) return n;
-    for (unsigned int i = 0; i < total && n < cap; i++) {
-        Class c = all[i];
-        if (c == base) continue;
-        Class s = c;
-        BOOL isSub = NO;
-        while ((s = class_getSuperclass(s))) {
-            if (s == base) { isSub = YES; break; }
+// 染色逻辑：只算「要传给原实现的入参」，不负责调回原实现。
+static id   VTPrepareStringStyle(id self, id attrs);
+static id   VTPrepareSignalColor(id self, id color, BOOL keepAlpha);
+static id   VTPrepareSignalStyle(id attrs);
+static void VTPostSetText(id self, id text);
+
+static void VTInvoke(int idx, id self, SEL _cmd, id a1, id a2) {
+    if (idx < 0 || idx >= gHookCount) return;
+    VTHookRec *r = &gHooks[idx];
+    if (!r->orig) return;
+
+    // 最后一道保险：任何没预料到的重入都只透传，绝不进染色逻辑。
+    if (gChainDepth >= VT_MAX_CHAIN_DEPTH) {
+        VTCallOrig(r, self, _cmd, a1, a2);
+        return;
+    }
+    gChainDepth++;
+    id pass = a1;
+    BOOL postText = NO;
+    @try {
+        switch (r->kind) {
+            case VTKindDataAggregated:
+            case VTKindDataCompletion:
+                VTCaptureVPNFromData(a1);
+                VTNoteTransition();
+                break;
+            case VTKindStringStyle:    pass = VTPrepareStringStyle(self, a1); break;
+            case VTKindStringSetText:  postText = YES; break;   // 必须先调 orig
+            case VTKindSignalActive:   pass = VTPrepareSignalColor(self, a1, NO);  break;
+            case VTKindSignalInactive: pass = VTPrepareSignalColor(self, a1, YES); break;
+            case VTKindSignalStyle:    pass = VTPrepareSignalStyle(a1); break;
+            default: break;
         }
-        if (isSub) out[n++] = c;
+    } @catch (NSException *e) {
+        // 算入参出错 → 原样透传。绝不能因为染色逻辑异常就把系统这次状态栏
+        // 更新整个吞掉：旧写法把 VTCallOrig 放在 try 里，异常一抛状态栏就卡住。
+        pass = a1;
+        postText = NO;
     }
-    free(all);
-    return n;
-}
-
-/// 泛化收集：类名含 needle 且实现了 sel 的类（应对私有类改名）。
-static int VTCollectByName(const char *needle, SEL sel, Class *out, int cap) {
-    if (!needle || !sel || !out || cap <= 0) return 0;
-    int n = 0;
-    unsigned int total = 0;
-    Class *all = objc_copyClassList(&total);
-    if (!all) return 0;
-    for (unsigned int i = 0; i < total && n < cap; i++) {
-        Class c = all[i];
-        const char *cn = class_getName(c);
-        if (!cn || !strcasestr(cn, needle)) continue;
-        if (!class_getInstanceMethod(c, sel)) continue;
-        out[n++] = c;
+    @try { VTCallOrig(r, self, _cmd, pass, a2); }
+    @catch (NSException *e) {}
+    if (postText) {
+        @try { VTPostSetText(self, a1); } @catch (NSException *e) {}
     }
-    free(all);
-    return n;
+    gChainDepth--;
 }
 
 // ============================================================================
-// 染色实现
+// 染色逻辑（1.0.3）
+//
+// 这里的函数只计算「要传给系统原实现的入参」，不负责调回原实现。
+// 调回统一由 VTInvoke 里的 VTCallOrig 完成 —— 每个 hook 点必然且只调一次。
 // ============================================================================
-
-/// 闸门期间记录到 gSeen 的视图，闸门打开后补染一次
-/// （覆盖「先连 VPN 再 respring」：那时 setActiveColor: 早已调用完）。
 
 #pragma mark - 数据层：VPN 状态
 
@@ -626,56 +719,36 @@ static void VTCaptureVPNFromData(id data) {
     } @catch (NSException *e) {}
 }
 
-static void VTHookUpdateAggregated(id self, SEL _cmd, id data) {
-    VTCaptureVPNFromData(data);
-    VTNoteTransition();
-    VTChain1(self, _cmd, data);
-}
-
-static void VTHookUpdateWithCompletion(id self, SEL _cmd, id data, id handler) {
-    VTCaptureVPNFromData(data);
-    VTNoteTransition();
-    VTChain2(self, _cmd, data, handler);
-}
-
 #pragma mark - 文字层：4G / 5G
 
-static void VTHookStringApplyStyle(id self, SEL _cmd, id attrs) {
+static id VTPrepareStringStyle(id self, id attrs) {
     id pass = attrs;
     VTRemember((UIView *)self);
-    if (VTShouldTint() && gTintTypeText && attrs) {
-        @try {
-            NSString *t = [(UILabel *)self text];
-            if (VTIsNetworkTypeText(t)) {
-                STUIStatusBarStyleAttributes *sa = (STUIStatusBarStyleAttributes *)attrs;
-                // ★ 必须在 copy 之前读：改的是副本，原始入参才是系统本来要用的色
-                UIColor *sys = nil;
-                if ([sa respondsToSelector:@selector(textColor)]) sys = [sa textColor];
-                UIColor *paint = gTintColor;
-                if (sys && paint) {
-                    id copy = [sa copy];
-                    if (copy) {
-                        [(STUIStatusBarStyleAttributes *)copy setTextColor:paint];
-                        pass = copy;
-                        VTRecord(self, @"tc", sys, paint);
-                        if (gTintHits++ == 0) {
-                            VTLog(@"首次上色（文字）：%s text=%@", class_getName(object_getClass(self)), t);
-                        }
-                    }
-                }
-            }
-        } @catch (NSException *e) {}
-    }
-    VTChain1(self, _cmd, pass);
+    if (!VTShouldTint() || !gTintTypeText || !attrs) return pass;
+    @try {
+        NSString *t = [(UILabel *)self text];
+        if (!VTIsNetworkTypeText(t)) return pass;
+        STUIStatusBarStyleAttributes *sa = (STUIStatusBarStyleAttributes *)attrs;
+        UIColor *sys = nil;
+        if ([sa respondsToSelector:@selector(textColor)]) sys = [sa textColor];
+        UIColor *paint = gTintColor;
+        if (!sys || !paint) return pass;
+        id copy = [sa copy];
+        if (!copy) return pass;
+        [(STUIStatusBarStyleAttributes *)copy setTextColor:paint];
+        VTRecord(self, @"tc", sys, paint);
+        if (gTintHits++ == 0) {
+            VTLog(@"首次上色（文字）：%s text=%@", class_getName(object_getClass(self)), t);
+        }
+        return copy;
+    } @catch (NSException *e) { return pass; }
 }
 
-static void VTHookStringSetText(id self, SEL _cmd, NSString *text) {
-    VTChain1(self, _cmd, text);
+static void VTPostSetText(id self, id text) {
     if (VTIsNetworkTypeText(text)) VTRemember((UIView *)self);
     if (!VTShouldTint() || !gTintTypeText) return;
     if (!VTIsNetworkTypeText(text)) return;
     @try {
-        // self.textColor 可能已是我们上一轮染的（VTRecord 会识别并拒绝记账）
         UIColor *cur = [(UILabel *)self textColor];
         UIColor *paint = gTintColor;
         if (paint && ![cur isEqual:paint]) {
@@ -690,69 +763,45 @@ static void VTHookStringSetText(id self, SEL _cmd, NSString *text) {
 
 #pragma mark - 图标层：Wi-Fi / 蜂窝信号
 
-static void VTHookSetActiveColor(id self, SEL _cmd, UIColor *color) {
-    UIColor *pass = color;
+static id VTPrepareSignalColor(id self, id color, BOOL keepAlpha) {
+    id pass = color;
     VTRemember((UIView *)self);
-    if (VTShouldTint() && gTintBars && color) {
-        @try {
-            UIColor *paint = gTintColor;
-            if (paint) {
-                VTRecord(self, @"ac", color, paint);
-                pass = paint;
-                if (gTintHits++ == 0) {
-                    VTLog(@"首次上色（active）：%s", class_getName(object_getClass(self)));
-                }
-            }
-        } @catch (NSException *e) {}
-    }
-    VTChain1(self, _cmd, pass);
+    if (!VTShouldTint() || !gTintBars || !color) return pass;
+    @try {
+        UIColor *orig = (UIColor *)color;
+        UIColor *paint = keepAlpha ? VTKeepAlpha(orig, gTintColor) : gTintColor;
+        if (!paint) return pass;
+        VTRecord(self, keepAlpha ? @"ic" : @"ac", orig, paint);
+        if (gTintHits++ == 0) {
+            VTLog(@"首次上色（%s）：%s", keepAlpha ? "inactive" : "active",
+                  class_getName(object_getClass(self)));
+        }
+        return paint;
+    } @catch (NSException *e) { return pass; }
 }
 
-static void VTHookSetInactiveColor(id self, SEL _cmd, UIColor *color) {
-    UIColor *pass = color;
-    VTRemember((UIView *)self);
-    if (VTShouldTint() && gTintBars && color) {
-        @try {
-            // ★★ 保 alpha：见文件头 ⑤
-            UIColor *paint = VTKeepAlpha(color, gTintColor);
-            if (paint) {
-                VTRecord(self, @"ic", color, paint);
-                pass = paint;
-            }
-        } @catch (NSException *e) {}
-    }
-    VTChain1(self, _cmd, pass);
-}
-
-/// 信号视图另一条改色通路：样式属性直接下发 tint。改副本，不记账
-/// （副本只影响本次绘制，下一次样式下发会自然覆盖）。
-static void VTHookSignalApplyStyle(id self, SEL _cmd, id attrs) {
+static id VTPrepareSignalStyle(id attrs) {
     id pass = attrs;
-    if (VTShouldTint() && gTintBars && attrs) {
-        @try {
-            STUIStatusBarStyleAttributes *sa = (STUIStatusBarStyleAttributes *)attrs;
-            UIColor *sys = nil;
-            UIColor *sysDim = nil;
-            if ([sa respondsToSelector:@selector(imageTintColor)]) sys = [sa imageTintColor];
-            if (!sys && [sa respondsToSelector:@selector(textColor)]) sys = [sa textColor];
-            if ([sa respondsToSelector:@selector(imageDimmedTintColor)]) sysDim = [sa imageDimmedTintColor];
-            if (sys && gTintColor) {
-                id copy = [sa copy];
-                if (copy) {
-                    if ([copy respondsToSelector:@selector(setImageTintColor:)]) {
-                        [(STUIStatusBarStyleAttributes *)copy setImageTintColor:gTintColor];
-                    }
-                    // ★★ dimmed 也要保 alpha：压到 0.2 同样会把次要元素弄没
-                    UIColor *dimmed = VTKeepAlpha(sysDim ?: sys, gTintColor);
-                    if (dimmed && [copy respondsToSelector:@selector(setImageDimmedTintColor:)]) {
-                        [(STUIStatusBarStyleAttributes *)copy setImageDimmedTintColor:dimmed];
-                    }
-                    pass = copy;
-                }
-            }
-        } @catch (NSException *e) {}
-    }
-    VTChain1(self, _cmd, pass);
+    if (!VTShouldTint() || !gTintBars || !attrs) return pass;
+    @try {
+        STUIStatusBarStyleAttributes *sa = (STUIStatusBarStyleAttributes *)attrs;
+        UIColor *sys = nil;
+        UIColor *sysDim = nil;
+        if ([sa respondsToSelector:@selector(imageTintColor)]) sys = [sa imageTintColor];
+        if (!sys && [sa respondsToSelector:@selector(textColor)]) sys = [sa textColor];
+        if ([sa respondsToSelector:@selector(imageDimmedTintColor)]) sysDim = [sa imageDimmedTintColor];
+        if (!sys || !gTintColor) return pass;
+        id copy = [sa copy];
+        if (!copy) return pass;
+        if ([copy respondsToSelector:@selector(setImageTintColor:)]) {
+            [(STUIStatusBarStyleAttributes *)copy setImageTintColor:gTintColor];
+        }
+        UIColor *dimmed = VTKeepAlpha(sysDim ?: sys, gTintColor);
+        if (dimmed && [copy respondsToSelector:@selector(setImageDimmedTintColor:)]) {
+            [(STUIStatusBarStyleAttributes *)copy setImageDimmedTintColor:dimmed];
+        }
+        return copy;
+    } @catch (NSException *e) { return pass; }
 }
 
 #pragma mark - 闸门打开后补染
@@ -767,13 +816,11 @@ static void VTRepaintSeen(void) {
             if (!v || !v.superview) continue;
             @try {
                 if ([v respondsToSelector:@selector(setActiveColor:)]) {
-                    IMP imp = [v methodForSelector:@selector(setActiveColor:)];
-                    if (imp) ((void (*)(id, SEL, id))imp)(v, @selector(setActiveColor:), gTintColor);
+                    ((void (*)(id, SEL, id))objc_msgSend)(v, @selector(setActiveColor:), gTintColor);
                     painted++;
                 }
                 if ([v respondsToSelector:@selector(setInactiveColor:)]) {
-                    IMP imp = [v methodForSelector:@selector(setInactiveColor:)];
-                    if (imp) ((void (*)(id, SEL, id))imp)(v, @selector(setInactiveColor:), gTintColor);
+                    ((void (*)(id, SEL, id))objc_msgSend)(v, @selector(setInactiveColor:), gTintColor);
                 }
                 if ([v isKindOfClass:[UILabel class]]) {
                     NSString *t = [(UILabel *)v text];
@@ -857,105 +904,71 @@ static void VTStartPrefWatch(void) {
 // 入口
 // ============================================================================
 
-/// 装一组 hook，返回成功条数。
+/// 精确类名安装（1.0.3）。
+/// 不再遍历全部类：启动早期对大量私有类调 class_getInstanceMethod 可能触发
+/// +initialize；且「基类 + 全部子类同时 hook」正是 1.0.2 递归崩溃的来源。
+/// 这里只 hook 参考实现验证过的具体类；具体类一个都取不到时才退到基类，
+/// 且基类与具体类不会同时装。
+
+static int VTHookNamedClass(const char *name, VTHookKind kind, SEL sel, BOOL twoArgs) {
+    if (!name || !sel) return 0;
+    Class c = objc_getClass(name);
+    if (!c) return 0;
+    return VTHookMethod(c, sel, kind, twoArgs) ? 1 : 0;
+}
+
 static int VTInstall17(void) {
     int n = 0;
-    SEL selApply  = VTSelApplyStyle();
-    SEL selText   = VTSelSetText();
-    SEL selActive = VTSelSetActive();
-    SEL selInact  = VTSelSetInactive();
-
-    // ① 状态栏数据（VPN 状态主源）
-    Class sb = objc_getClass("STUIStatusBar");
-    if (sb) {
-        if (VTHookMethod(sb, NSSelectorFromString(@"_updateWithAggregatedData:"),
-                         (IMP)VTHookUpdateAggregated)) n++;
-        if (VTHookMethod(sb, NSSelectorFromString(@"_updateWithData:completionHandler:"),
-                         (IMP)VTHookUpdateWithCompletion)) n++;
+    if (gHookLevel >= 1) {
+        n += VTHookNamedClass("STUIStatusBar", VTKindDataAggregated,
+                              NSSelectorFromString(@"_updateWithAggregatedData:"), NO);
+        n += VTHookNamedClass("STUIStatusBar", VTKindDataCompletion,
+                              NSSelectorFromString(@"_updateWithData:completionHandler:"), YES);
     }
-
-    // ② 文字视图（4G / 5G）—— 按类名 + 方法存在性收集，抗私有类改名。
-    //    两个收集结果取并集：StringView 一层可能既有基类也有子类，各自都 override 过。
-    Class strBuf[64];
-    int strN = VTCollectByName("StringView", selApply, strBuf, 64);
-    for (int i = 0; i < strN; i++) {
-        if (VTHookMethod(strBuf[i], selApply, (IMP)VTHookStringApplyStyle)) n++;
+    if (gHookLevel >= 2) {
+        n += VTHookNamedClass("STUIStatusBarStringView", VTKindStringStyle, VTSelApplyStyle(), NO);
+        n += VTHookNamedClass("STUIStatusBarStringView", VTKindStringSetText, VTSelSetText(), NO);
     }
-    int setTextN = VTCollectByName("StringView", selText, strBuf, 64);
-    for (int i = 0; i < setTextN; i++) {
-        if (VTHookMethod(strBuf[i], selText, (IMP)VTHookStringSetText)) n++;
-    }
-
-    // ③ 信号视图（Wi-Fi / 蜂窝）—— 基类 + 全部子类；基类不存在时退化为按名收集。
-    //    两路结果合并：STUIStatusBarSignalView 的子类里，Wi-Fi 与蜂窝各一个，
-    //    任一路漏掉都会出现「只有 Wi-Fi 变色 / 只有信号格变色」。
-    Class merged[128];
-    int mergedN = 0;
-    Class sigBuf[96];
-    Class sigBase = objc_getClass("STUIStatusBarSignalView");
-    if (sigBase) {
-        int k = VTCollectSubclasses(sigBase, sigBuf, 96);
-        for (int i = 0; i < k && mergedN < 128; i++) merged[mergedN++] = sigBuf[i];
-    }
-    int byName = VTCollectByName("SignalView", selInact, sigBuf, 96);
-    for (int i = 0; i < byName && mergedN < 128; i++) {
-        BOOL dup = NO;
-        for (int j = 0; j < mergedN; j++) {
-            if (merged[j] == sigBuf[i]) { dup = YES; break; }
+    if (gHookLevel >= 3) {
+        int before = gHookCount;
+        n += VTHookNamedClass("STUIStatusBarWifiSignalView", VTKindSignalActive,   VTSelSetActive(),   NO);
+        n += VTHookNamedClass("STUIStatusBarWifiSignalView", VTKindSignalInactive, VTSelSetInactive(), NO);
+        n += VTHookNamedClass("STUIStatusBarWifiSignalView", VTKindSignalStyle,    VTSelApplyStyle(),  NO);
+        n += VTHookNamedClass("STUIStatusBarCellularSignalView", VTKindSignalActive,   VTSelSetActive(),   NO);
+        n += VTHookNamedClass("STUIStatusBarCellularSignalView", VTKindSignalInactive, VTSelSetInactive(), NO);
+        n += VTHookNamedClass("STUIStatusBarCellularSignalView", VTKindSignalStyle,    VTSelApplyStyle(),  NO);
+        if (gHookCount == before) {
+            // 具体子类都不存在：只装基类兜底，绝不与子类同时装
+            n += VTHookNamedClass("STUIStatusBarSignalView", VTKindSignalActive,   VTSelSetActive(),   NO);
+            n += VTHookNamedClass("STUIStatusBarSignalView", VTKindSignalInactive, VTSelSetInactive(), NO);
+            n += VTHookNamedClass("STUIStatusBarSignalView", VTKindSignalStyle,    VTSelApplyStyle(),  NO);
         }
-        if (!dup) merged[mergedN++] = sigBuf[i];
     }
-    for (int i = 0; i < mergedN; i++) {
-        if (VTHookMethod(merged[i], selActive, (IMP)VTHookSetActiveColor)) n++;
-        if (VTHookMethod(merged[i], selInact, (IMP)VTHookSetInactiveColor)) n++;
-        // applyStyleAttributes: 不是每个信号类都实现，装不上不算失败
-        VTHookMethod(merged[i], selApply, (IMP)VTHookSignalApplyStyle);
-    }
-
-    VTLog(@"iOS17 hook：data=%d string=%d signal=%d（共 %d 条）",
-          sb ? 1 : 0, strN, mergedN, n);
+    VTLog(@"iOS17 hook：level=%d 已装=%d 条", gHookLevel, gHookCount);
     return n;
 }
 
 static int VTInstall16(void) {
     int n = 0;
-    SEL selApply  = VTSelApplyStyle();
-    SEL selText   = VTSelSetText();
-    SEL selActive = VTSelSetActive();
-    SEL selInact  = VTSelSetInactive();
-
-    Class strBuf[64];
-    int strN = VTCollectByName("StringView", selApply, strBuf, 64);
-    for (int i = 0; i < strN; i++) {
-        if (VTHookMethod(strBuf[i], selApply, (IMP)VTHookStringApplyStyle)) n++;
+    if (gHookLevel >= 2) {
+        n += VTHookNamedClass("_UIStatusBarStringView", VTKindStringStyle, VTSelApplyStyle(), NO);
+        n += VTHookNamedClass("_UIStatusBarStringView", VTKindStringSetText, VTSelSetText(), NO);
     }
-    int setTextN = VTCollectByName("StringView", selText, strBuf, 64);
-    for (int i = 0; i < setTextN; i++) {
-        if (VTHookMethod(strBuf[i], selText, (IMP)VTHookStringSetText)) n++;
-    }
-
-    Class merged[128];
-    int mergedN = 0;
-    Class sigBuf[96];
-    Class sigBase = objc_getClass("_UIStatusBarSignalView");
-    if (sigBase) {
-        int k = VTCollectSubclasses(sigBase, sigBuf, 96);
-        for (int i = 0; i < k && mergedN < 128; i++) merged[mergedN++] = sigBuf[i];
-    }
-    int byName = VTCollectByName("StatusBarSignalView", selInact, sigBuf, 96);
-    for (int i = 0; i < byName && mergedN < 128; i++) {
-        BOOL dup = NO;
-        for (int j = 0; j < mergedN; j++) {
-            if (merged[j] == sigBuf[i]) { dup = YES; break; }
+    if (gHookLevel >= 3) {
+        int before = gHookCount;
+        n += VTHookNamedClass("_UIStatusBarWifiSignalView", VTKindSignalActive,   VTSelSetActive(),   NO);
+        n += VTHookNamedClass("_UIStatusBarWifiSignalView", VTKindSignalInactive, VTSelSetInactive(), NO);
+        n += VTHookNamedClass("_UIStatusBarWifiSignalView", VTKindSignalStyle,    VTSelApplyStyle(),  NO);
+        n += VTHookNamedClass("_UIStatusBarCellularSignalView", VTKindSignalActive,   VTSelSetActive(),   NO);
+        n += VTHookNamedClass("_UIStatusBarCellularSignalView", VTKindSignalInactive, VTSelSetInactive(), NO);
+        n += VTHookNamedClass("_UIStatusBarCellularSignalView", VTKindSignalStyle,    VTSelApplyStyle(),  NO);
+        if (gHookCount == before) {
+            n += VTHookNamedClass("_UIStatusBarSignalView", VTKindSignalActive,   VTSelSetActive(),   NO);
+            n += VTHookNamedClass("_UIStatusBarSignalView", VTKindSignalInactive, VTSelSetInactive(), NO);
+            n += VTHookNamedClass("_UIStatusBarSignalView", VTKindSignalStyle,    VTSelApplyStyle(),  NO);
         }
-        if (!dup) merged[mergedN++] = sigBuf[i];
     }
-    for (int i = 0; i < mergedN; i++) {
-        if (VTHookMethod(merged[i], selActive, (IMP)VTHookSetActiveColor)) n++;
-        if (VTHookMethod(merged[i], selInact, (IMP)VTHookSetInactiveColor)) n++;
-    }
-
-    VTLog(@"iOS16 hook：string=%d signal=%d（共 %d 条）", strN, mergedN, n);
+    VTLog(@"iOS16 hook：level=%d 已装=%d 条", gHookLevel, gHookCount);
     return n;
 }
 
@@ -980,13 +993,19 @@ static BOOL VTIsIOS17OrLater(void) {
     return cached == 1;
 }
 
-__attribute__((constructor))
 static void VTInitialize(void) {
     @autoreleasepool {
         @try {
             VTLoadPrefs();
             if (!gEnabled) {
                 VTLog(@"VpnTint %s：总开关关闭，直接退出", VT_VERSION);
+                return;
+            }
+            if (gHookLevel <= 0) {
+                // 无卸载降级：level=0 时连私有框架都不 dlopen，更不装任何 hook。
+                // 万一又出安全模式，把 HookLevel 设 0 再 respring 就能判断是不是
+                // 本插件造成的，不必先进安全模式卸载。
+                VTLog(@"VpnTint %s：HookLevel=0，本轮不加载框架、不装任何 hook", VT_VERSION);
                 return;
             }
 
@@ -1003,15 +1022,17 @@ static void VTInitialize(void) {
             }
 
             int hooks = is17 ? VTInstall17() : VTInstall16();
+            VTCommitHooks();   // 所有 orig 记录完毕后，才统一替换 IMP
 
             gVPNFromData = NO;
             gVPNFromCF   = gCFFallback ? VTDetectVPNByCFNetwork() : NO;
 
-            VTLog(@"VpnTint %s 已加载 | host=%@ | iOS%d | StatusStatusUI=%d | hook=%d | VPN=%d(源=%@)",
+            VTLog(@"VpnTint %s 已加载 | host=%@ | iOS%d | StatusStatusUI=%d | level=%d | hook=%d | VPN=%d(源=%@)",
                   VT_VERSION,
                   [[NSProcessInfo processInfo] processName],
                   is17 ? 17 : 16,
                   dloked ? 1 : 0,
+                  gHookLevel,
                   hooks,
                   VTIsVPNOn() ? 1 : 0,
                   gVPNFromData ? @"data" : (gVPNFromCF ? @"代理设置" : @"无"));
@@ -1036,4 +1057,18 @@ static void VTInitialize(void) {
             VTLog(@"构造异常：%@", e);
         }
     }
+}
+
+__attribute__((constructor))
+static void VTConstructor(void) {
+    // ★ 1.0.3：constructor 阶段 dyld 还在装载镜像，Foundation / UIKit /
+    //   StatusStatusUI 都可能没初始化完。1.0.2 在这里同步 dlopen + 全量遍历
+    //   类表 + 改 IMP，是「装上就进安全模式」的第二个嫌疑。
+    //   这里只投递一个 block，真正的初始化放到主队列的第一个 turn。
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @autoreleasepool {
+            @try { VTInitialize(); }
+            @catch (NSException *e) { VTLog(@"初始化异常：%@", e); }
+        }
+    });
 }

@@ -2,4 +2,5 @@
 packages/
 out/
 *.deb
+*.bak
 .DS_Store

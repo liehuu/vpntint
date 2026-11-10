@@ -130,22 +130,36 @@ def strip_code(s):
 
 
 def body_of(code, signature):
-    """按花括号配平取函数体。"""
-    idx = code.find(signature)
-    if idx < 0:
+    """按花括号配平取函数体；跳过同名的前向声明。
+
+    踩过的坑：Tweak.m 里 `static void VTInvoke(...);` 有一条前向声明，
+    旧实现直接 code.find("{", idx) 会跨过这条声明，取到后面**别的函数**的
+    函数体 → VTInvoke 的三条判据变成恒 FAIL，且从报错里看不出是判据写错了。
+    所以每个候选匹配都要先看签名后面第一个结束符是 '{'（定义）还是 ';'（声明）。
+    """
+    start = 0
+    while True:
+        idx = code.find(signature, start)
+        if idx < 0:
+            return None
+        j = idx + len(signature)
+        while j < len(code) and code[j] not in "{;":
+            j += 1
+        if j >= len(code):
+            return None
+        if code[j] == ";":
+            start = j + 1          # 前向声明，继续找下一个同签名位置
+            continue
+        brace = j
+        depth = 0
+        for i in range(brace, len(code)):
+            if code[i] == "{":
+                depth += 1
+            elif code[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return code[brace:i + 1]
         return None
-    brace = code.find("{", idx)
-    if brace < 0:
-        return None
-    depth = 0
-    for i in range(brace, len(code)):
-        if code[i] == "{":
-            depth += 1
-        elif code[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return code[brace:i + 1]
-    return None
 
 
 def run_checks(raw, quiet=False):
@@ -158,9 +172,9 @@ def run_checks(raw, quiet=False):
 
     # ---------- 1. hook 目标必须是 iOS 17 的 STUIStatusBar* 体系 ----------
     # 这是 1.0.0/1.0.1 完全失效的根因，必须钉死。判字面量 → 用 nc。
-    chk('objc_getClass("STUIStatusBar") 在场（iOS 17 私有体系）',
-        'objc_getClass("STUIStatusBar")' in nc,
-        "未找到 objc_getClass(\"STUIStatusBar\"): iOS 17 上 _UIStatusBar* 不会被实例化")
+    chk('精确类名安装含 STUIStatusBar（iOS 17 私有体系）',
+        'VTHookNamedClass("STUIStatusBar",' in nc,
+        "未找到精确类安装目标 STUIStatusBar：iOS 17 上 _UIStatusBar* 不会被实例化")
 
     chk("装有 _updateWithAggregatedData: hook",
         "_updateWithAggregatedData:" in nc,
@@ -221,28 +235,100 @@ def run_checks(raw, quiet=False):
     banned = re.findall(r"killall|sbreload|respring", code, re.I)
     chk("源码不含重启桌面动作", not banned, "出现: %s" % sorted(set(banned)))
 
-    # ---------- 7. 每个 hook 都必须有空检查 ----------
+    # ---------- 7. hook 安装器必须安全 ----------
     hm = body_of(code, "static BOOL VTHookMethod")
     chk("VTHookMethod 存在", hm is not None, "缺 VTHookMethod")
     if hm:
-        chk("VTHookMethod 有对空检查", "if (!c || !sel || !repl)" in hm,
-            "VTHookMethod 缺空检查")
+        chk("VTHookMethod 有入参空检查", "if (!c || !sel) return NO;" in hm,
+            "VTHookMethod 缺入参空检查")
+        chk("VTHookMethod 防同一(类,SEL)重复安装",
+            "gHooks[i].cls == c" in hm and "return NO" in hm,
+            "缺重复安装检查：同一类同一个 SEL 装两次会把 orig 指向自己的 repl")
+        chk("VTHookMethod 有槽位上限", "gHookCount >= VT_MAX_HOOKS" in hm,
+            "缺槽位上限：会写穿 gHooks 数组")
+        chk("原 IMP 精确绑定到槽位", "gHooks[gHookCount].orig    = eff" in hm,
+            "orig 没有写进该 hook 自己的槽位")
 
-    # ---------- 8. 链式调用不能漏（漏了 = 系统原行为被吞掉） ----------
-    chain_missing = []
-    for fn, chain in (
-        ("static void VTHookUpdateAggregated", "VTChain1"),
-        ("static void VTHookUpdateWithCompletion", "VTChain2"),
-        ("static void VTHookStringApplyStyle", "VTChain1"),
-        ("static void VTHookStringSetText", "VTChain1"),
-        ("static void VTHookSetActiveColor", "VTChain1"),
-        ("static void VTHookSetInactiveColor", "VTChain1"),
-    ):
-        b = body_of(code, fn)
-        if b is None or chain not in b:
-            chain_missing.append(fn.split()[-1])
-    chk("所有 hook 都链式调回原实现", not chain_missing,
-        "缺: %s" % ", ".join(chain_missing))
+    # 记录与替换必须分离。若边记录边替换，而两个被 hook 的类存在继承关系，
+    # 后装的类用 class_getInstanceMethod 会取到前一个已被换掉的 trampoline，
+    # orig 就指向我们自己的 hook —— 双重染色，极端情况下又是递归。
+    cm = body_of(code, "static void VTCommitHooks")
+    ini = body_of(code, "static void VTInitialize")
+    chk("VTHookMethod 只预约不替换 IMP",
+        hm is not None and "class_replaceMethod" not in hm,
+        "安装阶段就替换了 IMP：继承关系下会把 orig 记成自己的 trampoline")
+    chk("VTCommitHooks 统一替换 IMP",
+        cm is not None and "class_replaceMethod(r->cls, r->sel, repl, r->types);" in cm,
+        "缺统一提交：所有槽位记录完之前不能动任何 IMP")
+    chk("VTInitialize 调用 VTCommitHooks",
+        ini is not None and "VTCommitHooks();" in ini,
+        "记录了但没提交：一条 hook 都不会生效")
+    chk("HookLevel=0 时完全不装 hook",
+        ini is not None and "if (gHookLevel <= 0) {" in ini,
+        "缺无卸载降级：再出安全模式时用户无法自证是不是本插件造成的")
+
+    # ---------- 8. 调回原实现（漏了 = 系统原行为被吞掉） ----------
+    # 1.0.3 起所有 hook 共用一个 VTInvoke，必须保证每个分支最终都调一次 VTCallOrig。
+    iv = body_of(code, "static void VTInvoke")
+    chk("VTInvoke 存在", iv is not None, "缺 VTInvoke")
+    if iv:
+        chk("VTInvoke 每个分支都调回原实现", "VTCallOrig(r, self, _cmd, pass, a2);" in iv,
+            "VTInvoke 漏了调回原实现，状态栏会停止刷新")
+        chk("VTInvoke 有递归深度保险", "gChainDepth >= VT_MAX_CHAIN_DEPTH" in iv,
+            "缺递归深度保险：意外重入会直接栈溢出（@try 拦不住 SIGSEGV）")
+        chk("VTInvoke 深度计数成对增减",
+            "gChainDepth++" in iv and "gChainDepth--" in iv,
+            "gChainDepth 不是成对增减，会永久卡在某个深度")
+        pc = iv.find("@catch")
+        po = iv.find("VTCallOrig(r, self, _cmd, pass, a2);")
+        chk("prepare 异常不吞原实现",
+            "pass = a1;" in iv and 0 <= pc < po,
+            "原实现调用仍在 prepare 的 @try 里：染色逻辑一抛异常就把这次状态栏更新吞掉")
+
+    co = body_of(code, "static void VTCallOrig")
+    chk("VTCallOrig 存在", co is not None, "缺 VTCallOrig")
+    if co:
+        chk("VTCallOrig 只用槽位绑定的 orig", "r->orig" in co and "object_getClass" not in co,
+            "VTCallOrig 又在按 self 的类查表 —— 这正是 1.0.2 递归崩溃的根因")
+        chk("VTCallOrig 对空 IMP 有保护", "if (!imp) return;" in co,
+            "VTCallOrig 缺空 IMP 检查")
+
+    # ---------- 8b. 崩溃防护（1.0.2 进安全模式的四条根因，逐条钉死） ----------
+    # 负向断言一律在剥过注释的文本上做，否则文件头那段事故说明会被判成违规。
+    chk("不做全量类表遍历 objc_copyClassList",
+        "objc_copyClassList" not in code,
+        "又出现全量类表遍历：启动早期对私有类触发 +initialize 会崩宿主")
+    chk("不按实例的类查原 IMP（VTFindOrig/VTChain 已废除）",
+        "VTFindOrig" not in code and "VTChain1" not in code and "VTChain2" not in code,
+        "又出现按 object_getClass(self) 沿继承链查 orig 的写法")
+    chk("不用 __thread/TLS（越狱 dylib 加载期风险）",
+        "__thread" not in code and "_Thread_local" not in code,
+        "TLS 变量依赖 dyld 的 TLV 支持，加载期就可能失败")
+    chk("初始化延迟到主队列，不在 constructor 里改 IMP",
+        "VTConstructor" in code and "dispatch_async(dispatch_get_main_queue()" in code,
+        "缺 VTConstructor 延迟初始化：constructor 阶段 Foundation/私有框架尚未就绪")
+
+    tramps = re.findall(r"VT_TRAMP\((\d+)\)", nc)
+    cases = re.findall(r"VT_CASE\((\d+)\)", nc)
+    chk("每个槽位都有独立 trampoline（24 个且编号一致）",
+        len(tramps) == 24 and len(cases) == 24 and tramps == cases,
+        "VT_TRAMP=%d VT_CASE=%d，槽位数不匹配会让部分 hook 拿到别人的 orig"
+        % (len(tramps), len(cases)))
+
+    chk("有 HookLevel 渐进开关（出问题时可不卸载就降级）",
+        "gHookLevel" in code and 'd[@"HookLevel"]' in nc,
+        "缺 HookLevel：用户遇到安全模式只能卸载重装，无法分级定位")
+
+    # 补染/还原不能再直接取 methodForSelector 的 IMP：那拿到的是我们替换后的
+    # repl，直调会二次进入染色逻辑并可能重入。必须走正常消息派发。
+    rp = body_of(nc, "static void VTRepaintSeen")
+    rs = body_of(nc, "static void VTRestoreSlot")
+    chk("补染走 objc_msgSend 而非直取 IMP",
+        rp is not None and "objc_msgSend" in rp and "methodForSelector:@selector(set" not in rp,
+        "VTRepaintSeen 里仍在直调 methodForSelector 拿到的 IMP")
+    chk("还原走 objc_msgSend 而非直取 IMP",
+        rs is not None and "objc_msgSend" in rs,
+        "VTRestoreSlot 里仍在直调 methodForSelector 拿到的 IMP")
 
     # ---------- 9. VPN 判定双源（数据层为主，代理设置为兜底） ----------
     chk("VPN 判定读 vpnEntry",
@@ -273,8 +359,10 @@ def selftest(raw, path):
     global QUIET
     print("== 反向自检：确认每条关键判据都能失败 ==")
     variants = [
+        # ---- 1.0.0/1.0.1「完全没效果」那一批教训 ----
         ("砍掉 STUIStatusBar（模拟 1.0.1 的错误 hook 目标）",
-         raw.replace('objc_getClass("STUIStatusBar")', 'objc_getClass("_UIStatusBarItemView")'),
+         raw.replace('VTHookNamedClass("STUIStatusBar",',
+                     'VTHookNamedClass("_UIStatusBarItemView",'),
          "STUIStatusBar"),
         ("砍掉 vpnEntry 读取",
          raw.replace("vpnEntry", "vpnFoo"),
@@ -294,6 +382,81 @@ def selftest(raw, path):
          raw.replace("BOOL is17 = VTIsIOS17OrLater();",
                      "BOOL is17 = NO; if (@available(iOS 17, *)) is17 = YES;"),
          "@available"),
+
+        # ---- 1.0.2「进安全模式」那一批教训：每条防护都要能失败 ----
+        ("VTCallOrig 改回按 self 的类查表（1.0.2 递归根因）",
+         raw.replace("IMP imp = r ? r->orig : NULL;",
+                     "IMP imp = VTFindOrig(object_getClass(self), _cmd);"),
+         "只用槽位绑定的 orig"),
+        ("删掉递归深度保险",
+         raw.replace("if (gChainDepth >= VT_MAX_CHAIN_DEPTH) {", "if (0) {"),
+         "递归深度保险"),
+        ("深度计数不再成对增减",
+         raw.replace("gChainDepth--;", "/* no decrement */"),
+         "成对增减"),
+        ("漏掉调回原实现",
+         raw.replace("VTCallOrig(r, self, _cmd, pass, a2);", "/* no orig call */"),
+         "每个分支都调回原实现"),
+        ("加回全量类表遍历",
+         raw.replace("static int VTInstall17(void) {",
+                     "static int VTInstall17(void) {\n"
+                     "    unsigned int dummy = 0; objc_copyClassList(&dummy);"),
+         "全量类表遍历"),
+        ("初始化改回 constructor 里同步执行",
+         raw.replace("dispatch_async(dispatch_get_main_queue(), ^{",
+                     "dispatch_async(dispatch_get_global_queue(0, 0), ^{"),
+         "延迟到主队列"),
+        ("砍掉一个 trampoline 槽位",
+         raw.replace("VT_TRAMP(23)\n", ""),
+         "独立 trampoline"),
+        ("用回 TLS 变量",
+         raw.replace("static volatile int gChainDepth = 0;",
+                     "static __thread int gChainDepth = 0;"),
+         "TLS"),
+        ("去掉 HookLevel 渐进开关",
+         raw.replace("gHookLevel", "gLevelFixed"),
+         "HookLevel"),
+        ("补染又去直取 methodForSelector 的 IMP",
+         raw.replace("((void (*)(id, SEL, id))objc_msgSend)(v, @selector(setActiveColor:), gTintColor);",
+                     "IMP imp = [v methodForSelector:@selector(setActiveColor:)];\n"
+                     "                    ((void (*)(id, SEL, id))imp)(v, @selector(setActiveColor:), gTintColor);"),
+         "补染走 objc_msgSend"),
+        ("还原又去直取 methodForSelector 的 IMP",
+         raw.replace("((void (*)(id, SEL, id))objc_msgSend)(view, sel, color);",
+                     "IMP imp = [view methodForSelector:sel];\n"
+                     "        ((void (*)(id, SEL, id))imp)(view, sel, color);"),
+         "还原走 objc_msgSend"),
+        ("去掉 hook 槽位上限",
+         raw.replace("if (gHookCount >= VT_MAX_HOOKS) return NO;", ""),
+         "槽位上限"),
+        ("去掉重复安装检查",
+         raw.replace("if (gHooks[i].cls == c && sel_isEqual(gHooks[i].sel, sel)) return NO;", ""),
+         "重复安装"),
+        ("orig 写错槽位",
+         raw.replace("gHooks[gHookCount].orig    = eff;", "gHooks[0].orig = eff;"),
+         "精确绑定到槽位"),
+        ("VTCallOrig 去掉空 IMP 保护",
+         raw.replace("if (!imp) return;", ""),
+         "空 IMP"),
+        ("VTHookMethod 去掉入参空检查",
+         raw.replace("if (!c || !sel) return NO;", ""),
+         "入参空检查"),
+        ("安装阶段又直接替换 IMP（回到边记录边替换）",
+         raw.replace("    gHookCount++;\n    return YES;\n}\n\n/// 统一提交",
+                     "    gHookCount++;\n"
+                     "    class_replaceMethod(c, sel, repl, method_getTypeEncoding(m));\n"
+                     "    return YES;\n}\n\n/// 统一提交"),
+         "只预约不替换"),
+        ("删掉统一提交（记录完不装 hook）",
+         raw.replace("            VTCommitHooks();   // 所有 orig 记录完毕后，才统一替换 IMP\n", ""),
+         "VTInitialize 调用"),
+        ("原实现调用挪回 prepare 的 try 里（异常吞掉状态栏更新）",
+         raw.replace("@try { VTCallOrig(r, self, _cmd, pass, a2); }",
+                     "/* 原实现调用被挪走了 */"),
+         "prepare 异常不吞"),
+        ("去掉 HookLevel=0 无害降级",
+         raw.replace("if (gHookLevel <= 0) {", "if (0) {"),
+         "HookLevel=0"),
     ]
 
     QUIET = True

@@ -175,27 +175,50 @@ jobs:
       - uses: softprops/action-gh-release@v2
         if: github.event_name == 'workflow_dispatch'
         with:
-          tag_name: v1.0.2
-          name: VpnTint 1.0.2（修复完全无效果：hook 了错误的私有类）
+          tag_name: v1.0.3
+          name: VpnTint 1.0.3（修复安装后进安全模式：hook 框架递归崩溃）
           body: |
-            VPN 连接时状态栏 Wi-Fi 图标 / 蜂窝信号 / 4G-5G 字样变橙色，断开恢复默认色。
+            **请先卸载 v1.0.2。v1.0.2 会让 SpringBoard 崩溃并进入安全模式，不要继续使用。**
 
-            **1.0.2 修复「装上完全没效果」**，两条根因：
-            1. **hook 目标类选错了。** iOS 17 起状态栏迁到私有框架
-               `StatusStatusUI.framework`，类名从 `_UIStatusBar*` 换成 `STUIStatusBar*`。
-               旧版 hook 的 `_UIStatusBarItemView` 在 iOS 17 上根本不会被实例化，
-               一个触发点都没有 —— 插件等于没装。现在改为 hook
-               `STUIStatusBar` 的数据更新方法、`STUIStatusBarStringView`、
-               `STUIStatusBarSignalView` 及其子类，并 dlopen 该框架确保启动早期也能取到类。
-            2. **染色方式选错了。** iOS 17 的信号视图是自绘的，颜色取自
-               `activeColor` / `inactiveColor`。旧版对它们写 `tintColor` 完全无效。
-               现在直接改这两个属性。
+            功能不变：VPN 连接时状态栏 Wi-Fi 图标 / 蜂窝信号 / 4G-5G 字样变橙色，断开恢复默认色。
 
-            同时并入三条实机验证过的机制：启动 500ms 闸门（避免 respring 后图标空白）、
-            断开后主动写回原色（否则橙色残留）、未激活色保留原 alpha（否则图标看不见）。
+            ## 1.0.3 修的是「装完进安全模式」
 
-            装完请手动 respring。查询诊断日志：
-            `/var/mobile/Library/Logs/VpnTint.log`，启动行会打印每个 hook 点的安装条数。
+            这是 SpringBoard 崩溃，不是「没生效」。根因在 1.0.2 的 hook 框架：
+
+            1. 同一个替换实现被装到「基类 + 全部子类」，而原 IMP 是按
+               `object_getClass(self)` 沿继承链查的。子类的 override 调
+               `[super setActiveColor:]` 时 `self` 仍是子类实例，会查回子类
+               自己的 orig → 无限递归 → 栈溢出 → SpringBoard 崩 → 安全模式。
+               `@try/@catch` 拦不住 `SIGSEGV`。
+            2. `objc_copyClassList` 全量遍历、在 constructor 阶段对大量私有类
+               调 `class_getInstanceMethod`，可能触发 `+initialize`，宿主尚未就绪就崩。
+            3. 补染 / 还原直取 `methodForSelector` 的 IMP，拿到的是替换后的实现，会二次进入 hook。
+
+            1.0.3 的结构性修复：
+
+            - 每个 `(类, SEL)` 一个独立 trampoline，原 IMP 精确绑到自己的槽位；
+              调回原实现只从槽位取 `orig`，**绝不按 `self` 的类查表**。
+            - 记录与替换分两阶段：先把所有系统原始 IMP 记完，再统一替换，
+              避免继承关系下把 orig 记成自己的 trampoline。
+            - 只 hook 精确命名的具体类，不做全量类表遍历；基类兜底与具体类互斥。
+            - 初始化从 constructor 延迟到主队列；补染 / 还原改走 `objc_msgSend`。
+            - 递归深度保险；染色逻辑异常时原样透传，绝不吞掉状态栏更新。
+
+            ## 装完如果还有问题（不用卸载就能自证）
+
+            在 `/var/mobile/Library/Preferences/com.liehuu.vpntint.plist` 里设 `HookLevel`：
+
+            - `0` = 完全不加载框架、不装任何 hook（最安全，用来确认崩溃是否来自本插件）
+            - `1` = 只装数据层（VPN 判定）
+            - `2` = 数据层 + 文字层
+            - `3` = 全部（默认）
+
+            改完 respring。启动行会打印 `level=` 与 `hook=` 条数。
+
+            包内**不含任何 maintainer script**（不会打断 dpkg），装完请**手动 respring**。
+            诊断日志：`/var/mobile/Library/Logs/VpnTint.log`。
+            若仍崩溃，请提供 `/var/mobile/Library/Logs/CrashReporter/` 里的 `SpringBoard-*.ips`。
 
             - `vpntint-rootless.deb`：Dopamine / palera1n rootless（有 /var/jb）
             - `vpntint-roothide.deb`：RootHide / roothide bootstrap（iphoneos-arm64e）
