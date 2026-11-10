@@ -73,31 +73,32 @@ jobs:
 
       - name: Build rootless (iphoneos-arm64)
         run: |
-          set -o pipefail
           make clean >/dev/null 2>&1 || true
           # 编译日志同时落到文件：Actions 的 logs 端点在本账号下鉴权受限，
-          # 拿不到时只能靠这个 artifact 排错。
+          # 拿不到时只能靠这个 artifact 排错。PIPESTATUS 保住 make 的真实退出码。
+          set +e
           make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless 2>&1 | tee /tmp/build-rootless.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          [ "$rc" -eq 0 ] || { echo "rootless 构建失败 rc=$rc"; exit "$rc"; }
           mkdir -p out
           ls -l packages/
           cp packages/*.deb out/vpntint-rootless.deb
-
-      - name: 上传编译日志（失败时也要有）
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-logs
-          path: /tmp/build-*.log
-          if-no-files-found: ignore
 
       - name: Build roothide (iphoneos-arm64e)
         run: |
           rm -rf packages
           make clean >/dev/null 2>&1 || true
-          if make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide 2>&1 | tee /tmp/build-roothide.log; then
+          # 注意：`cmd | tee` 的退出码是 tee 的，必须用 PIPESTATUS 取 make 的真实结果，
+          # 否则失败会被当成成功一路走下去（这里踩过）。
+          set +e
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide 2>&1 | tee /tmp/build-roothide.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc" -eq 0 ]; then
             echo "roothide scheme 构建成功"
           else
-            echo "roothide scheme 不可用，改用 rootful 布局 + 改 Architecture"
+            echo "roothide scheme 不可用（rc=$rc），改用 rootful 布局 + 改 Architecture"
             make clean >/dev/null 2>&1 || true
             rm -rf packages
             make package FINALPACKAGE=1 2>&1 | tee -a /tmp/build-roothide.log
@@ -110,6 +111,14 @@ jobs:
           fi
           ls -l packages/
           cp packages/*.deb out/vpntint-roothide.deb
+
+      - name: 上传编译日志（失败时也要有）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: /tmp/build-*.log
+          if-no-files-found: ignore
 
       - name: 校验产物
         run: |
