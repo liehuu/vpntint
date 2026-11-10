@@ -17,7 +17,9 @@ jobs:
       - name: 安装依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential fakeroot rsync curl perl zip git xz-utils libtinfo6 libssl-dev dpkg
+          # zstd：roothide 包的 data.tar.zst 要让 verify_release.py 解开。
+          # CI 的 python3 是 3.12/3.13，没有 compression.zstd，只能靠这个命令兜底。
+          sudo apt-get install -y build-essential fakeroot rsync curl perl zip git xz-utils zstd libtinfo6 libssl-dev dpkg
           # theos 自带的 plistutil 依赖 libplist，24.04 上包名可能不同，逐个试
           for p in libplist-2.0-4 libplist-2.0-3 libplist3 libplist-utils; do
             sudo apt-get install -y "$p" || echo "skip $p"
@@ -155,28 +157,12 @@ jobs:
             fi
             echo "OK: 无 postinst"
 
-            echo "--- dylib 内必须含 iOS 17 hook 目标（源码对了但产物没变 = 假修复）---"
-            # 反向自检：确认 strings|grep 这条路真能查出东西，否则下面是装饰
-            if strings "$dylib" | grep -q 'STUIStatusBarItemView_NONEXISTENT'; then
-              echo "FAIL: 反向自检失效，grep 对任意串都命中"
-              exit 1
-            fi
-            for s in STUIStatusBar STUIStatusBarSignalView setActiveColor: setInactiveColor: vpnEntry StatusStatusUI; do
-              if strings "$dylib" | grep -qF "$s"; then
-                echo "  OK 产物含 $s"
-              else
-                echo "  FAIL 产物里没有 $s —— hook 目标没编进去"
-                exit 1
-              fi
-            done
-            # 反面：旧的错误目标不该再出现（_UIStatusBarSignalView 仍保留给 iOS16 分支，
-            # 只禁止 _UIStatusBarItemView 这个 1.0.1 的错误入口）
-            if strings "$dylib" | grep -qF '_UIStatusBarItemView'; then
-              echo "FAIL: 产物里还有 _UIStatusBarItemView（1.0.1 的错误 hook 目标）"
-              exit 1
-            fi
-            echo "OK: hook 目标正确"
           done
+          # 产物断言集中在 tools/verify_release.py（11 项）：包结构 / 无 maintainer script /
+          # 双切片 / filter plist / hook 目标字符串 / 反面禁旧目标。
+          # --selftest 先对真实 deb 逐条投毒，证明每条断言真的会失败，
+          # 否则下面的「全通过」只是一排永远为真的装饰。
+          python3 tools/verify_release.py --selftest out/*.deb
           echo "OK: 两个包都通过校验"
 
       - uses: actions/upload-artifact@v4
