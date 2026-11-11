@@ -351,6 +351,21 @@ def run_checks(raw, quiet=False):
         "NSHomeDirectory()" in nc and
         "probe = [NSFileHandle fileHandleForWritingAtPath:p]" in nc,
         "缺可写性验证：fileExists / 目录建成功都不等于能写文件")
+    # 顺序判据：NSLog 必须在「文件是否可用」的守卫**之前**。
+    # 1.0.3 写得正好相反 —— 文件写不进去就 return，系统日志那行永远执行不到，
+    # 于是「找不到文件日志」和「系统日志里也没痕迹」同时成立，
+    # 把一次可诊断的失败变成了完全无证据的失败。
+    # 注意：必须用「带参数列表」的完整签名定位，不能用 "static void VTLog"。
+    # 文件里先有一句前向声明 `static void VTLog(NSString *fmt, ...);`，
+    # 按短前缀找会命中声明、拿到的是 VTLogInit 的函数体 —— 判据于是对着错的东西断言。
+    log_body = body_of(nc, "static void VTLog(NSString *fmt, ...)") or ""
+    i_nslog = log_body.find("NSLog(")
+    i_guard = log_body.find("if (!gLogPath)")
+    chk("NSLog 早于文件判断（文件写不了时系统日志仍有）",
+        i_nslog >= 0 and i_guard >= 0 and i_nslog < i_guard,
+        "NSLog 被放在 if(!gLogPath) return 之后：文件日志不可写时，"
+        "系统日志也一起丢失，观测手段整体失效（实测 pos nslog=%d guard=%d len=%d）"
+        % (i_nslog, i_guard, len(log_body)))
 
     # ---------- 9. VPN 判定双源（数据层为主，代理设置为兜底） ----------
     chk("VPN 判定读 vpnEntry",
@@ -371,6 +386,16 @@ def run_checks(raw, quiet=False):
         "缺版本判断，iOS 17 / iOS 16 两套 hook 无法分流")
 
     return list(oks), list(fails)
+
+
+def _move_nslog_after_guard(raw):
+    """把 NSLog 那行从「守卫之前」挪到「守卫之后」，复现 1.0.3 的失效顺序。"""
+    line = '        NSLog(@"VpnTint: %@", msg);\n'
+    guard = '        if (!gLogPath) return;\n'
+    if line not in raw or guard not in raw:
+        return raw                      # 返回原文 → 上层会判「变体未生效」
+    body = raw.replace(line, "", 1)
+    return body.replace(guard, guard + line, 1)
 
 
 def selftest(raw, path):
@@ -487,8 +512,14 @@ def selftest(raw, path):
          raw.replace('VTLog(@"[5/7] hook 记录完成 %d 条，准备统一替换 IMP", hooks);\n', ""),
          "分步打点齐全"),
         ("去掉 NSLog 兜底（回到只写文件）",
-         raw.replace('NSLog(@"VpnTint: %@", msg);   // 系统日志兜底：不依赖任何文件是否可写\n', ""),
+         raw.replace('NSLog(@"VpnTint: %@", msg);\n', ""),
          "os_log"),
+        # 顺序回归：1.0.3 的 NSLog 被放在 `if (!gLogPath) return;` 之后，
+        # 文件写不了时系统日志也一起哑掉，等于观测手段整体失效。
+        # 这条投毒把 NSLog 挪回条件之后，必须被「NSLog 早于文件判断」抓住。
+        ("把 NSLog 挪回文件判断之后（观测失效的老写法）",
+         _move_nslog_after_guard(raw),
+         "NSLog 早于文件判断"),
         ("去掉日志试写探针",
          raw.replace("probe = [NSFileHandle fileHandleForWritingAtPath:p]",
                      "probe = nil"),

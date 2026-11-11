@@ -6,8 +6,8 @@ VPN 连接时把状态栏的 **Wi-Fi 图标 / 蜂窝信号 / 4G-5G 字样** 染�
 - 注入目标：仅 `com.apple.springboard`（iOS 13 起应用内状态栏也由 SpringBoard 渲染，无需注入 App）
 - 无依赖库、无设置面板，配置走一个 plist
 
-> **⚠️ 请勿再使用 v1.0.2。** 该版会让 SpringBoard 崩溃并进入安全模式。先卸载再装 1.0.3。
-> 当前版本 **1.0.3**，修的就是上面这个崩溃。
+> **⚠️ 请勿再使用 v1.0.2 / v1.0.3。** 两版都会让 SpringBoard 进安全模式。
+> 当前版本 **1.0.4**：修掉了 1.0.3 仍然崩的两个静态层缺陷（arm64e 老式 ABI、日志不可写）。
 
 ## 安装
 
@@ -19,9 +19,32 @@ VPN 连接时把状态栏的 **Wi-Fi 图标 / 蜂窝信号 / 4G-5G 字样** 染�
 用 Sileo / Zebra / Filza 安装，**装完手动点一次 respring**。
 包里故意不带 postinst —— 原因见下面「为什么包里不带 postinst」。
 
-## 如果之前装过 1.0.2 / 已经进了安全模式
+## 装完先看日志（1.0.4 起真正可读）
 
-安全模式 = SpringBoard 崩溃后 Substrate 把 tweak 全部禁用了，不是「插件没生效」。按顺序处理：
+1.0.3 的「找不到 `VpnTint.log`」是个假线索：旧版只往 `/var/mobile/Library/Logs/`
+和 `/tmp/` 写，SpringBoard 沙箱两个都拒绝，而且写失败完全静默。
+更糟的是 `NSLog` 兜底被放在「文件是否可用」判断**之后** —— 文件写不了，系统日志也一起哑掉。
+所以**「没有日志」这件事，本身就说明不了插件有没有被加载**。
+
+1.0.4 改成：
+
+- 优先 `NSHomeDirectory()/Documents/VpnTint.log`（进程自己的沙箱一定可写），
+  再依次试 `/var/mobile/Library/Logs/`、`/var/mobile/Documents/`、`/var/mobile/Media/`、
+  `/tmp/`、`/var/tmp/`；每个候选都**真的试开一次写句柄**，`fileExists` 不算数；
+- `NSLog` 提到判断之前，系统日志永远有；
+- 启动打 `[0/7]` … `[7/7]` 分步点。
+
+判读方式：
+
+| 日志内容 | 含义 |
+|---|---|
+| 有 `[0/7]`，无 `[7/7]` | 已被加载，卡在中间某步 —— 按最后一条编号定位 |
+| 一条都没有 | 根本没被加载，回到注入/签名层 |
+| 有 `[7/7]` 但不上色 | 功能层问题 |
+
+## 如果之前装过 1.0.2 / 1.0.3 / 已经进了安全模式
+
+安全模式 = SpringBoard 崩溃后注入器把 tweak 全部禁用了，不是「插件没生效」。按顺序处理：
 
 1. 在安全模式里用 Sileo 卸载 `com.liehuu.vpntint`；卸不掉就在 NewTerm（`su` root，默认 `alpine`）里禁用两个文件后重启桌面：
 
@@ -33,12 +56,12 @@ VPN 连接时把状态栏的 **Wi-Fi 图标 / 蜂窝信号 / 4G-5G 字样** 染�
    ```
 
    roothide 下 `$(jbroot)` 由注入环境提供；不要手写 `.jbroot-<HASH>` 路径。
-2. 正常进桌面后装 1.0.3，**手动 respring**。
+2. 正常进桌面后装 1.0.4，**手动 respring**。
 3. 若仍崩，不用卸载也能自证：把 `HookLevel` 设成 `0` 再 respring（见「配置」）。
    这一档连私有框架都不加载、一条 hook 都不装，插件等于完全不存在。
 4. 请把这两份东西发回来定位：
    - `/var/mobile/Library/Logs/CrashReporter/` 里的 `SpringBoard-*.ips`
-   - `/var/mobile/Library/Logs/VpnTint.log`
+   - `VpnTint.log`（先找 SpringBoard 沙箱的 Documents 目录）
 
 ## 为什么包里不带 postinst（1.0.1 起）
 
@@ -90,7 +113,41 @@ dpkg --remove --force-remove-reinstreq com.liehuu.vpntint
 | 1.0.0 / 1.0.1 | 装完**完全没效果** | hook 目标类错（iOS 17 已迁到 `StatusStatusUI` / `STUIStatusBar*`）；染色方式错（信号视图自绘，写 `tintColor` 无效） |
 | 1.0.1 起 | 「dpkg 被中断」修复 | 1.0.0 的 postinst 里 `killall -9 SpringBoard` 打断 dpkg configure |
 | 1.0.2 | **装完进安全模式** | hook 框架的继承链递归（见下） |
-| **1.0.3** | 修复上述崩溃，染色逻辑沿用 1.0.2 | 独立 trampoline + 槽位精确绑定 + 两阶段安装 + 延迟初始化 |
+| 1.0.3 | 修了递归，但**实机仍然进安全模式，且无日志、无新 ips** | arm64e 切片用的是老式 ABI（caps=0x00）；日志路径在 SpringBoard 沙箱不可写且失败静默（见下） |
+| **1.0.4** | 修上面两个静态层缺陷；染色逻辑沿用 | CI 里补 `CPU_SUBTYPE_PTRAUTH_ABI` 后重签 + 日志多候选试写 + `NSLog` 提前 + `[0/7]…[7/7]` 打点 |
+
+### 1.0.3 为什么「装了没反应、也没崩」
+
+三个症状同时成立——进安全模式、找不到日志、**没有新的 `SpringBoard-*.ips`**——
+指向的不是运行时崩溃，而是**加载期就被拒**。静态层查出两个具体缺陷：
+
+**（1）arm64e 切片是老式 ABI（头号嫌疑）**
+
+实测 1.0.3 的 arm64e 切片 `cpusubtype = 0x00000002`，高 8 位 caps = `0x00`，
+即缺 `CPU_SUBTYPE_PTRAUTH_ABI(0x80)`。这是 iOS 12/13 时代的老 arm64e ABI。
+LLVM 作者（llvm-project#104650）原话：
+
+> Modern arm64e requires versioned binaries: a binary with 0x00 caps in
+> cpusubtype is now rejected by the linker and everything after.
+
+dyld 在 arm64e 进程里会**优先挑 arm64e 切片**，于是加载的就是这一片。
+这与「装上进安全模式 + 一行代码没跑 + 零日志」完全吻合。
+
+修法有个必须守住的顺序：补 caps 会改 4 个字节，而它就落在**被签名的 `__TEXT` 第 0 页**里
+（实测 `__TEXT` 覆盖文件偏移 0..49152，caps 在偏移 8）。
+所以补完页哈希立刻失效（实测 `pages[0]` 从 `bf4207…` 变成 `b51ea7…`），
+**必须先补字节、再 `ldid -S` 重签**。反过来做会被内核以
+`SIGKILL - CODESIGNING` 杀掉，正是崩溃日志里那个 `termination.namespace=CODESIGNING`。
+
+**（2）日志路径在沙箱里根本写不进去**
+
+见上面「装完先看日志」。旧实现只有两个候选路径，且 `NSLog` 被条件挡在后面。
+
+这两条以前没被抓住，是因为门禁自己把要查的那一位掩掉了：
+`check_arch.py` 和 `verify_release.py` 都用 `sub & 0x00FFFFFF` 比 subtype，
+**caps 正好在被掩掉的 8 位里**，于是「arm64e 存在」永远为真、
+「这个 arm64e 是不是现代 ABI」从来没被检查过。1.0.4 单独取 caps 判 flags，
+并加了反向投毒证明这条断言真会失败。
 
 ### 1.0.2 为什么会崩（这次必须记住）
 
@@ -245,22 +302,33 @@ GitHub Actions 自动出双架构包（arm64 + arm64e，分两次编译后 fat�
 
 两道闸门（都在 CI 里跑，且每条判据都做过反向自检）：
 
-- `tools/check_source.py` —— 源码级 **47 项**。除 1.0.2 那批（hook 目标、染色方式、
-  保 alpha、闸门、断开还原、双源 VPN、禁 `@available`）外，1.0.3 又钉住了崩溃防护：
-  槽位精确绑定 `orig`、`VTCallOrig` 不许按 `object_getClass` 查表、禁 `objc_copyClassList` /
-  `VTFindOrig` / `__thread`、延迟到主队列、24 个 trampoline 编号一致、递归深度保险、
-  两阶段安装、`prepare` 异常不吞原实现、`HookLevel=0` 无害降级。
-  带 `--selftest`：逐一破坏 **26 条**关键机制，确认每条判据**真的会失败**，
-  并验证未被破坏的原始源码基线全通过（不做这步，闸门可能就是永远通过的装饰）。
-- `tools/verify_release.py` —— 产物级 **11 项**，直接读 deb 原始字节（自己解 ar + tar，
+- `tools/check_source.py` —— 源码级 **52 项**。除 1.0.2 那批（hook 目标、染色方式、
+  保 alpha、闸门、断开还原、双源 VPN、禁 `@available`）外，1.0.3 钉住了崩溃防护
+  （槽位精确绑定 `orig`、`VTCallOrig` 不许按 `object_getClass` 查表、禁
+  `objc_copyClassList` / `VTFindOrig` / `__thread`、延迟到主队列、24 个 trampoline
+  编号一致、递归深度保险、两阶段安装、`prepare` 异常不吞原实现、`HookLevel=0`
+  无害降级），1.0.4 又钉住观测本身：`[0/7]` 打点、`0..7` 分步齐全、`NSLog` 兜底、
+  **`NSLog` 必须早于 `if (!gLogPath)` 的守卫**、`NSHomeDirectory()` + 试写探针。
+  带 `--selftest`：逐一破坏 **31 条**关键机制，确认每条判据**真的会失败**。
+- `tools/verify_release.py` —— 产物级 **12 项**，直接读 deb 原始字节（自己解 ar + tar，
   不依赖 dpkg）：首成员 debian-binary、Version 与仓库根 `control` 一致、无任何
   maintainer script、dylib 与 plist 各 1 个、路径前缀与 Architecture 匹配
   （rootless 带 `var/jb/`，roothide 纯 `Library/`）、dylib 可执行位、filter plist 挂
-  `com.apple.springboard`、arm64 + arm64e 双切片、7 个 hook 目标字符串齐全、
-  且不含 `_UIStatusBarItemView` —— 防「源码改对了但产物没变」这类假修复。
-  带 `--selftest`：对真实 deb 逐条投毒 **9 条**（另加「清空 dylib」共 10 条），
-  先证明断言会失败，再判通过。
+  `com.apple.springboard`、arm64 + arm64e 双切片、**arm64e 带 ptrauth ABI 标志**、
+  7 个 hook 目标字符串齐全、且不含 `_UIStatusBarItemView` —— 防「源码改对了但产物没变」。
+  带 `--selftest`：对真实 deb 逐条投毒 **10 条 + 2 条反向**（含「把 caps 补成 0x80
+  必须变绿」），先证明断言会失败、再证明它不是永假，最后才判通过。
 - `tools/check_scripts.sh` —— 独立的 maintainer script 扫描（自带反向自检）。
+- `tools/check_codesign.py` —— 逐页重算 CodeDirectory 的 sha256，证明签名**真的覆盖
+  当前字节**。带 `--selftest`：翻转一个字节必须被抓到，还原必须复绿。
+- `tools/check_load.py` —— 加载期静态风险：依赖库是否全为系统库、未定义符号是否
+  含系统不提供的那类（`___isOSVersionAtLeast`）、arm64e 的 ptrauth ABI。
+- `tools/fix_deb_abi.py` —— 在 deb 层补 `CPU_SUBTYPE_PTRAUTH_ABI` 并重新签名。
+  运行顺序不可反：补字节会让页哈希失效，必须「先补后签」。
+
+CI 第 7 步专门处理 arm64e ABI：先 `--check-only` 证明「修之前确实缺标志」，
+再补 + 重签，最后用 `check_codesign.py` 复核签名覆盖新字节。
+若某天工具链本身就产出现代 ABI，这一步会自动变成 no-op（并打印说明）。
 
 `data.tar.zst` 的解压是三级兜底：内置 `compression.zstd`（Python 3.14+）→
 `zstandard` 模块（必须用 `stream_reader`，dpkg 的帧不带 content size）→ `zstd` 命令。
