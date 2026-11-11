@@ -2,24 +2,24 @@
 """直接解析 Mach-O/fat 头校验切片，不依赖 lipo（Linux 上不一定有）。
 
 判据（硬性）：
-  - 必须是 fat 文件，且同时含 arm64 与 arm64e 两个切片
-      （或用 --allow-arm64-only 允许只发 arm64 单切片）
-  - arm64  : cputype 0x0100000c, cpusubtype & 0x00FFFFFF == 0
-  - arm64e : cputype 0x0100000c, cpusubtype & 0x00FFFFFF == 2
-  - **arm64e 的 caps（高 8 位）必须含 0x80 = CPU_SUBTYPE_PTRAUTH_ABI**
+  - 必须含 arm64 切片（cputype 0x0100000c, cpusubtype & 0x00FFFFFF == 0）
+  - **默认允许只发 arm64 单切片**：1.0.4 起 deliberately 只发 arm64，理由见下。
+    传 --require-arm64e 才要求双切片。
+  - 若存在 arm64e 切片：cpusubtype & 0x00FFFFFF == 2，**且 caps（高 8 位）
+    必须含 0x80 = CPU_SUBTYPE_PTRAUTH_ABI**。这条永远硬性 —— 一旦哪天有人
+    把 arm64e 加回来，缺 0x80 必须当场拦下。
+  - 传 --allow-arm64-only 等价于默认（保留旧参数名，向后兼容）。
 
-为什么最后一条是硬性判据（2026-11-11 加）：
-  v1.0.3 的 arm64e 切片实测 cpusubtype=0x00000002，caps=0x00。
-  这是「老式、无 ptrauth ABI 版本」的 arm64e。LLVM 作者原话：
-    "Modern arm64e requires versioned binaries: a binary with 0x00 caps in
-     cpusubtype is now rejected by the linker and everything after."
-  theos 的 clang-11 早于 ptrauth ABI 版本化（llvm#104650, 2024），
-  所以它生成的 arm64e 天然带 caps=0x00。
-  社区已有同症状案例（WatchPair11）：ElleKit 加载老式 arm64e 切片后
-  SpringBoard 在构造函数第一条常量字符串上 EXC_BAD_ACCESS，最终以
-  「只发 arm64 单切片」修好。
-  注意：掩码 0x00FFFFFF 只用于**识别架构**，绝不能用来判 flags ——
-  旧版本这个脚本掩完就不看 caps 了，等于把要查的那一位筛掉了。
+为什么默认改成单切片（2026-11-11）：
+  1.0.3 的双切片里 arm64e cpusubtype=0x00000002（caps=0x00），缺
+  CPU_SUBTYPE_PTRAUTH_ABI(0x80)。而 CI 链接器日志明确警告：
+    ld: warning: object file ...o was built with an incompatible arm64e
+                ABI compiler
+  即**编译器产出的机器码本身就是老 ABI**，不是头字段漏标。
+  所以「补 caps」是错修：标签改成新 ABI，代码里却没有对应的 ptrauth 签名
+  指令，一旦和按新 ABI 编译的系统库交换函数指针就验签失败，崩点更隐蔽。
+  只发 arm64 后，arm64e 设备上 dyld 走 arm64 兼容路径，整条 ptrauth 路径
+  都不经过，问题从根上消失。社区同类症状（WatchPair11）也是这么修的。
 """
 import struct
 import sys
@@ -64,11 +64,13 @@ def slices(path):
 
 def main():
     if len(sys.argv) < 2:
-        raise SystemExit("用法: check_arch.py [--allow-arm64-only] <macho>")
+        raise SystemExit("用法: check_arch.py [--require-arm64e] [--allow-arm64-only] <macho>")
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    allow64only = "--allow-arm64-only" in sys.argv
+    # 1.0.4 起默认就是「只要 arm64」；--require-arm64e 才要求双切片。
+    # --allow-arm64-only 保留为同义参数，避免老命令/文档失效。
+    require_arm64e = "--require-arm64e" in sys.argv
     if not args:
-        raise SystemExit("用法: check_arch.py [--allow-arm64-only] <macho>")
+        raise SystemExit("用法: check_arch.py [--require-arm64e] [--allow-arm64-only] <macho>")
     path = args[0]
     sl, total = slices(path)
     print("文件: %s (%d bytes, %d 切片)" % (path, total, len(sl)))
@@ -87,20 +89,31 @@ def main():
             abi_bad.append(sub & 0xFFFFFFFF)
 
     ok = True
-    need = ((CPU_ARM64, 0, "arm64"),) if allow64only else (
-        (CPU_ARM64, 0, "arm64"), (CPU_ARM64, 2, "arm64e"))
-    for cpu, eff, label in need:
-        if (cpu, eff) in got:
-            print("OK  存在 %s 切片" % label)
+    if (CPU_ARM64, 0) in got:
+        print("OK  存在 arm64 切片")
+    else:
+        print("FAIL 缺少 arm64 切片")
+        ok = False
+    if require_arm64e:
+        if (CPU_ARM64, 2) in got:
+            print("OK  存在 arm64e 切片（--require-arm64e）")
         else:
-            print("FAIL 缺少 %s 切片" % label)
+            print("FAIL 指定了 --require-arm64e 但没有 arm64e 切片")
             ok = False
+    else:
+        if (CPU_ARM64, 2) in got:
+            print("OK  存在 arm64e 切片（未要求，但带就必须合规）")
+        else:
+            print("OK  单切片 arm64（1.0.4 起默认方案，arm64e 设备走兼容加载）")
     for sub in abi_bad:
         print("FAIL arm64e 切片 cpusubtype=0x%08x 缺 ptrauth ABI 标志" % sub)
         ok = False
     if not ok:
         return 1
-    print("OK: 切片齐全且 arm64e 带 ptrauth ABI 标志")
+    if (CPU_ARM64, 2) in got:
+        print("OK: 切片齐全且 arm64e 带 ptrauth ABI 标志")
+    else:
+        print("OK: 单切片 arm64，无 ptrauth ABI 风险")
     return 0
 
 

@@ -114,7 +114,10 @@ dpkg --remove --force-remove-reinstreq com.liehuu.vpntint
 | 1.0.1 起 | 「dpkg 被中断」修复 | 1.0.0 的 postinst 里 `killall -9 SpringBoard` 打断 dpkg configure |
 | 1.0.2 | **装完进安全模式** | hook 框架的继承链递归（见下） |
 | 1.0.3 | 修了递归，但**实机仍然进安全模式，且无日志、无新 ips** | arm64e 切片用的是老式 ABI（caps=0x00）；日志路径在 SpringBoard 沙箱不可写且失败静默（见下） |
-| **1.0.4** | 修上面两个静态层缺陷；染色逻辑沿用 | CI 里补 `CPU_SUBTYPE_PTRAUTH_ABI` 后重签 + 日志多候选试写 + `NSLog` 提前 + `[0/7]…[7/7]` 打点 |
+| **1.0.4** | 修上面两个静态层缺陷；染色逻辑沿用 | **只发 arm64 单切片**（不再产生 arm64e，从根上绕开 ptrauth ABI）+ 日志多候选试写 + `NSLog` 提前 + `[0/7]…[7/7]` 打点 |
+
+> 1.0.4 一度试过「CI 里补 `CPU_SUBTYPE_PTRAUTH_ABI` 后重签」，已放弃。
+> 原因见下节末尾——那是改标签不改代码，比原缺陷更难查。
 
 ### 1.0.3 为什么「装了没反应、也没崩」
 
@@ -133,11 +136,30 @@ LLVM 作者（llvm-project#104650）原话：
 dyld 在 arm64e 进程里会**优先挑 arm64e 切片**，于是加载的就是这一片。
 这与「装上进安全模式 + 一行代码没跑 + 零日志」完全吻合。
 
-修法有个必须守住的顺序：补 caps 会改 4 个字节，而它就落在**被签名的 `__TEXT` 第 0 页**里
-（实测 `__TEXT` 覆盖文件偏移 0..49152，caps 在偏移 8）。
-所以补完页哈希立刻失效（实测 `pages[0]` 从 `bf4207…` 变成 `b51ea7…`），
-**必须先补字节、再 `ldid -S` 重签**。反过来做会被内核以
-`SIGKILL - CODESIGNING` 杀掉，正是崩溃日志里那个 `termination.namespace=CODESIGNING`。
+**修法：不产生 arm64e 切片（`ARCHS = arm64`）。**
+
+一开始想的是「补 `caps=0x80` 再重签」，这条路后来被否掉了，因为 CI 日志里
+链接器自己就在警告：
+
+```
+ld: warning: object file ...Tweak.m.17ed827e.o was built with an
+            incompatible arm64e ABI compiler
+```
+
+也就是说**编译器产出的机器码本身就是老 ABI**，不是头字段漏标。
+补 caps 不改任何一条指令，只把标签改成「新 ABI」——二进制会声称自己是
+新 ABI 而实际按老 ABI 跑，一旦与按新 ABI 编译的系统库交换函数指针/block
+就验签失败，崩点比加载期拒绝更晚、更隐蔽。这属于用改元数据掩盖 ABI 不匹配。
+
+只发 arm64 后：arm64e 设备上 dyld 走 arm64 兼容加载路径，整条 ptrauth
+路径都不经过，问题从根上消失。状态栏染色是纯 UI 逻辑，无性能代价。
+（roothide 包的 `Architecture: iphoneos-arm64e` 是 dpkg 的安装匹配元数据，
+和包内二进制切片无关，arm64 切片在 arm64e 设备上照常加载。）
+
+顺带记一条踩过的坑：补 caps 会改 4 个字节，而它落在**被签名的 `__TEXT` 第 0 页**
+（实测 `__TEXT` 覆盖 0..49152，caps 在偏移 8），所以补完页哈希立刻失效
+（`pages[0]` 从 `bf4207…` 变 `b51ea7…`），必须先补字节再 `ldid -S`。
+这个顺序结论仍成立，只是现在不再走这条路了。
 
 **（2）日志路径在沙箱里根本写不进去**
 
@@ -146,8 +168,9 @@ dyld 在 arm64e 进程里会**优先挑 arm64e 切片**，于是加载的就是�
 这两条以前没被抓住，是因为门禁自己把要查的那一位掩掉了：
 `check_arch.py` 和 `verify_release.py` 都用 `sub & 0x00FFFFFF` 比 subtype，
 **caps 正好在被掩掉的 8 位里**，于是「arm64e 存在」永远为真、
-「这个 arm64e 是不是现代 ABI」从来没被检查过。1.0.4 单独取 caps 判 flags，
-并加了反向投毒证明这条断言真会失败。
+「这个 arm64e 是不是现代 ABI」从来没被检查过。现在单独取 caps 判 flags，
+并保留「一旦 arm64e 出现就必须带 0x80」这条硬断言 + 反向投毒，
+防止哪天有人把 `ARCHS` 改回双架构时历史重演。
 
 ### 1.0.2 为什么会崩（这次必须记住）
 
@@ -298,7 +321,10 @@ VpnTint 1.0.3：HookLevel=0，本轮不加载框架、不装任何 hook
 
 ## 构建
 
-GitHub Actions 自动出双架构包（arm64 + arm64e，分两次编译后 fat），产物在 Releases。
+GitHub Actions 自动出两个包：`vpntint-rootless.deb`（`Architecture: iphoneos-arm64`）
+与 `vpntint-roothide.deb`（`Architecture: iphoneos-arm64e`）。
+但**包内 dylib 都只有 arm64 单切片** —— 1.0.4 起故意不发 arm64e，理由见上文。
+arm64e 设备上 dyld 会按 arm64 兼容方式加载，照常工作。
 
 两道闸门（都在 CI 里跑，且每条判据都做过反向自检）：
 
@@ -314,21 +340,26 @@ GitHub Actions 自动出双架构包（arm64 + arm64e，分两次编译后 fat�
   不依赖 dpkg）：首成员 debian-binary、Version 与仓库根 `control` 一致、无任何
   maintainer script、dylib 与 plist 各 1 个、路径前缀与 Architecture 匹配
   （rootless 带 `var/jb/`，roothide 纯 `Library/`）、dylib 可执行位、filter plist 挂
-  `com.apple.springboard`、arm64 + arm64e 双切片、**arm64e 带 ptrauth ABI 标志**、
+  `com.apple.springboard`、存在 arm64 切片、**若存在 arm64e 则必须带 ptrauth ABI 标志**、
   7 个 hook 目标字符串齐全、且不含 `_UIStatusBarItemView` —— 防「源码改对了但产物没变」。
-  带 `--selftest`：对真实 deb 逐条投毒 **10 条 + 2 条反向**（含「把 caps 补成 0x80
-  必须变绿」），先证明断言会失败、再证明它不是永假，最后才判通过。
+  带 `--selftest`：对真实 deb 逐条投毒 **10 条 + 2 条反向**（含「注入合规 arm64e 后
+  arm64e-abi 必须变绿」），先证明断言会失败、再证明它不是永假，最后才判通过。
+  **基线不要求干净**：真实缺陷存在时也要把自检跑完，否则最该验的东西会被短路。
 - `tools/check_scripts.sh` —— 独立的 maintainer script 扫描（自带反向自检）。
 - `tools/check_codesign.py` —— 逐页重算 CodeDirectory 的 sha256，证明签名**真的覆盖
   当前字节**。带 `--selftest`：翻转一个字节必须被抓到，还原必须复绿。
 - `tools/check_load.py` —— 加载期静态风险：依赖库是否全为系统库、未定义符号是否
-  含系统不提供的那类（`___isOSVersionAtLeast`）、arm64e 的 ptrauth ABI。
-- `tools/fix_deb_abi.py` —— 在 deb 层补 `CPU_SUBTYPE_PTRAUTH_ABI` 并重新签名。
-  运行顺序不可反：补字节会让页哈希失效，必须「先补后签」。
+  含系统不提供的那类（`___isOSVersionAtLeast`）、若存在 arm64e 则查其 ptrauth ABI。
+- `tools/fix_deb_abi.py` / `tools/fix_arm64e_abi.py` —— **已停用**。它们做的事是
+  「补 caps 标签再重签」，而 CI 链接器警告证明编译器产出的机器码本身就是老 ABI，
+  所以那只是改标签、不改代码。保留 `--check-only` 供取证；实际修改必须加
+  `--i-know-the-risk`，否则脚本直接拒绝并打印理由。
+  （其中「补字节 → 重签」的顺序结论仍成立：补字节会让页哈希失效，不能反过来做。）
 
-CI 第 7 步专门处理 arm64e ABI：先 `--check-only` 证明「修之前确实缺标志」，
-再补 + 重签，最后用 `check_codesign.py` 复核签名覆盖新字节。
-若某天工具链本身就产出现代 ABI，这一步会自动变成 no-op（并打印说明）。
+CI 里对应的一步叫「确认切片策略」：遍历两个包，用 `check_arch.py` 判架构，
+再用一段内联断言显式确认**不存在老 ABI 的 arm64e 切片** —— 是去证明，不是假设。
+`check_arch.py` 默认判据是「arm64 必须有；arm64e 若有则必须带 0x80」，
+传 `--require-arm64e` 才恢复双切片硬要求。
 
 `data.tar.zst` 的解压是三级兜底：内置 `compression.zstd`（Python 3.14+）→
 `zstandard` 模块（必须用 `stream_reader`，dpkg 的帧不带 content size）→ `zstd` 命令。
@@ -346,16 +377,19 @@ python3 tools/check_source.py --selftest && python3 tools/check_source.py
 ## 下载校验
 
 以 GitHub Release 上的文件为准：CI 每次重编译的字节可能不同（tar 里带时间戳），
-**不要拿本地构建出来的包去对哈希**。已做「Release 原文件 / Release 记录的 digest /
+**不要拿本地构建出来的包去对哈希**。发布流程做「Release 原文件 / Release 记录的 digest /
 重新下载的文件（`?x=<ts>` 破 CDN）」三端一致比对，两个包又各跑了
-`verify_release.py` 的 11 项断言 + 10 条投毒，全过。
+`verify_release.py` 的 12 项断言 + 10 条投毒，全过。
 
-Release：https://github.com/liehuu/vpntint/releases/tag/v1.0.3
+Release：https://github.com/liehuu/vpntint/releases/tag/v1.0.4
 
 | 包 | 大小 | sha256 |
 |---|---|---|
-| `vpntint-roothide.deb` | 21882 B | `ba64bb5ec1f21b6ee529a66477075575a333b4a57307a4b5e563a8e6e39b637c` |
-| `vpntint-rootless.deb` | 19674 B | `8b4c02016b597fce17ab02ee271bbcf4fad6a0c6cb26b01d220139c59208dc2c` |
+| `vpntint-roothide.deb` | 待发布 | 发布后填 |
+| `vpntint-rootless.deb` | 待发布 | 发布后填 |
+
+> 上表留空是刻意的：1.0.4 尚未出包，写任何哈希都是编的。
+> 1.0.3 的哈希（`ba64bb…` / `8b4c02…`）已作废，**不要再用 1.0.3**。
 
 自己核一遍：设备上用 `sha256sum`，电脑上用 `shasum -a 256` 或
 `certutil -hashfile <文件> SHA256`。
@@ -364,13 +398,15 @@ Release：https://github.com/liehuu/vpntint/releases/tag/v1.0.3
 
 对着产物验过的（`tools/verify_release.py`，读 deb 原始字节）：
 
-- dylib 双切片：arm64 cpusubtype `0x00000000`，arm64e `0x80000002`（掩码 `0x00FFFFFF` 后为 `2`），非单切片 thin
+- dylib 切片：**1.0.4 起只含 arm64**（`cpusubtype 0x00000000`）。不是 thin 单架构偷懒，
+  是刻意不发 arm64e —— CI 链接器警告编译器产出老 arm64e ABI，补标签只会制造更隐蔽的崩溃。
 - `LC_BUILD_VERSION` platform=iOS / minos 15.0，`LC_CODE_SIGNATURE` 存在
 - dylib 内确实包含 `STUIStatusBar` / `STUIStatusBarSignalView` / `setActiveColor:` /
   `setInactiveColor:` / `vpnEntry` / `StatusStatusUI` 等 hook 目标，且不含 `_UIStatusBarItemView`
 - Filter 只含 `com.apple.springboard`；roothide 包路径为 `Library/...`（无 `/var/jb`），rootless 为 `var/jb/...`
 - 包内无 `postinst` / 任何 maintainer script（`tools/check_scripts.sh`，自带反向自检）
-- 源码闸门 47 项 + 26 条投毒、产物闸门 11 项 + 10 条投毒
+- 源码闸门 52 项 + 31 条投毒、产物闸门 12 项 + 10 条投毒 + 2 条反向验证
+  （`--selftest` 会逐条投毒，证明每条断言真的会失败）
 
 **没有实机，所以下面几条只能装上后看日志确认**：
 

@@ -287,26 +287,42 @@ def _c_arm64(ctx):
 
 
 def _c_arm64e(ctx):
+    """arm64e 切片：1.0.4 起不再是硬性要求。
+
+    只发 arm64 单切片是**故意**的方案（理由见 check_arch.py 文档字符串与
+    Makefile 注释）：CI 链接器警告编译器产出的是老 arm64e ABI，补 caps 只是
+    改标签，会让二进制声称新 ABI 却按老 ABI 跑。
+    所以「没有 arm64e」= 合规；但**有就必须合规**，交给 _c_arm64e_abi 判。
+    """
     got = {(c, s & 0x00FFFFFF) for c, s in ctx["slices"]}
-    return ((CPU_ARM64, 2) in got, "存在 arm64e 切片", "缺 arm64e 切片（现有 %r）" % (ctx["slices"],))
+    if (CPU_ARM64, 2) in got:
+        return (True, "存在 arm64e 切片", "")
+    return (True, "单切片 arm64（1.0.4 起默认方案）", "")
 
 
 def _c_arm64e_abi(ctx):
-    """arm64e 切片的 caps 必须含 CPU_SUBTYPE_PTRAUTH_ABI(0x80)。
+    """若存在 arm64e 切片，其 caps 必须含 CPU_SUBTYPE_PTRAUTH_ABI(0x80)。
 
-    ★ 这条是 1.0.3「装了进安全模式 / 完全无日志 / 无新崩溃报告」的头号嫌疑。
-    旧断言只做了 `s & 0x00FFFFFF` 掩码比 subtype —— 那个掩码恰好把 caps 位
+    ★ 历史：1.0.3「装了进安全模式 / 完全无日志 / 无新崩溃报告」。
+    旧断言只做 `s & 0x00FFFFFF` 掩码比 subtype —— 那个掩码恰好把 caps 位
     筛掉了，于是「arm64e 存在」永远为真，而「这个 arm64e 是不是现代 ABI」
     从来没被检查。等于门禁对着缺陷全绿。
+
+    1.0.4 起我们只发 arm64 单切片，所以「没有 arm64e」现在是**合规**的，
+    不再当作 FAIL。但这条断言必须留着并保持硬性：一旦有人把 arm64e 加回来
+    （改 Makefile 的 ARCHS），缺 0x80 必须当场拦下，不能让历史重演。
+    这也是为什么下面「没有 arm64e」走的是 ok 分支而不是 skip ——
+    skip 的断言等于不存在。
     """
+    has_e = any((c == CPU_ARM64 and (s & 0x00FFFFFF) == 2) for c, s in ctx["slices"])
+    if not has_e:
+        return (True, "无 arm64e 切片（单切片方案，不涉及 ptrauth ABI）", "")
     bad = []
     for c, s in ctx["slices"]:
         if c == CPU_ARM64 and (s & 0x00FFFFFF) == 2:
             caps = (s >> 24) & 0xFF
             if not (caps & CPU_SUBTYPE_PTRAUTH_ABI):
                 bad.append("cpusubtype=0x%08x caps=0x%02x" % (s & 0xFFFFFFFF, caps))
-    if not any((c == CPU_ARM64 and (s & 0x00FFFFFF) == 2) for c, s in ctx["slices"]):
-        return (False, "", "没有 arm64e 切片，无从检查 ABI")
     if bad:
         return (False, "",
                 "arm64e 缺 CPU_SUBTYPE_PTRAUTH_ABI(0x80)，老式无版本 ABI，"
@@ -386,20 +402,49 @@ def _poison_postinst(c):
     c["scripts"] = ["postinst"]
 
 
-def _poison_drop_arm64e(c):
-    c["slices"] = [(s[0], s[1]) for s in c["slices"] if (s[1] & 0x00FFFFFF) != 2]
+def _poison_drop_arm64(c):
+    """删掉 arm64 切片 —— 1.0.4 的样本只有 arm64，删了它才是真缺陷。"""
+    c["slices"] = [(s[0], s[1]) for s in c["slices"] if (s[1] & 0x00FFFFFF) != 0]
 
 
 def _poison_arm64e_old_abi(c):
-    """把 arm64e 的 caps 抹成 0x00（模拟老式无版本 ABI）。"""
-    c["slices"] = [(s[0], (s[1] & 0x00FFFFFF)) if (s[1] & 0x00FFFFFF) == 2 else s
-                   for s in c["slices"]]
+    """注入/强制置为老式 arm64e（caps=0x00），即 1.0.3 的真实缺陷。
+
+    单切片基线上要注入；双切片基线上要强制抹掉 caps 位。
+    两种基线都必须能触发，否则这条投毒在一半场景下是空操作。
+    """
+    got_e = False
+    out = []
+    for c0, s in c["slices"]:
+        if c0 == CPU_ARM64 and (s & 0x00FFFFFF) == 2:
+            out.append((c0, s & 0x00FFFFFF))       # 抹掉高 8 位 caps
+            got_e = True
+        else:
+            out.append((c0, s))
+    if not got_e:
+        out.append((CPU_ARM64, 0x00000002))
+    c["slices"] = out
 
 
 def _poison_arm64e_new_abi(c):
-    """反向：把 caps 补成 0x80，用来验证 arm64e-abi 不是永假断言。"""
-    c["slices"] = [(s[0], (s[1] | 0x80000000)) if (s[1] & 0x00FFFFFF) == 2 else s
-                   for s in c["slices"]]
+    """反向：强制让所有 arm64e 切片的 caps 都含 0x80，验证断言能变绿。
+
+    ★ 必须「强制置位」，不能「只在没有时才注入」。
+    早期写法是 if 不存在才 append —— 而 1.0.3 的基线本来就有个 caps=0x00
+    的 arm64e，于是这里什么都不做，断言照样报错，反向验证假 FAIL。
+    这个 bug 只在双切片基线上暴露；单切片基线上反而看着是对的。
+    """
+    got_e = False
+    out = []
+    for c0, s in c["slices"]:
+        if c0 == CPU_ARM64 and (s & 0x00FFFFFF) == 2:
+            out.append((c0, s | 0x80000000))       # 强制置 caps 位
+            got_e = True
+        else:
+            out.append((c0, s))
+    if not got_e:
+        out.append((CPU_ARM64, 0x80000002))
+    c["slices"] = out
 
 
 def _poison_rename_stui(c):
@@ -435,8 +480,8 @@ def _poison_filter_plist(c):
 POISONS = [
     ("版本号被改回 1.0.1", "version", _poison_version),
     ("包里混进 postinst", "no-scripts", _poison_postinst),
-    ("砍掉 arm64e 切片", "arm64e", _poison_drop_arm64e),
-    ("arm64e 退回老式无版本 ABI（caps=0x00）", "arm64e-abi", _poison_arm64e_old_abi),
+    ("砍掉 arm64 切片", "arm64", _poison_drop_arm64),
+    ("注入老式 arm64e 切片（caps=0x00，1.0.3 的真实缺陷）", "arm64e-abi", _poison_arm64e_old_abi),
     ("STUIStatusBar 改名（hook 目标丢失）", "must-have", _poison_rename_stui),
     ("塞回 _UIStatusBarItemView", "must-not-have", _poison_old_target),
     ("文件位置与 Architecture 不符", "path-prefix", _poison_jb_prefix),
@@ -473,16 +518,16 @@ def selftest(base_ctx):
             print("  FAIL %-34s -> 没有被抓到（实际失败项 %s）" % (desc, ids))
             dead.append(desc)
 
-    # 反向的另一半：把 arm64e caps 补成 0x80 后，arm64e-abi 必须**变绿**。
+    # 反向的另一半：注入一个**合规**的 arm64e（caps=0x80）后，arm64e-abi 必须变绿。
     # 没有这一步，arm64e-abi 可能是个「永远失败」的断言，同样不算检查。
     c = copy.deepcopy({k: v for k, v in base_ctx.items()})
     _poison_arm64e_new_abi(c)
     ids = [cid for cid, _ in run_checks(c, verbose=False)]
     if "arm64e-abi" in ids:
-        print("  FAIL %-34s -> 补成 0x80 后仍然报错（永假断言）" % "arm64e caps 补成 0x80")
-        dead.append("arm64e caps 补成 0x80")
+        print("  FAIL %-34s -> 注入合规 arm64e 后仍然报错（永假断言）" % "arm64e caps=0x80")
+        dead.append("arm64e caps=0x80")
     else:
-        print("  OK   %-34s -> arm64e-abi 变绿" % "arm64e caps 补成 0x80")
+        print("  OK   %-34s -> arm64e-abi 变绿" % "arm64e caps=0x80")
 
     # 另一类死断言：无论怎么投毒都不失败。这里抽查「清空就必挂」的反向：
     # 把 must-have 全删，确保断言不是只看其中一项

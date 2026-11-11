@@ -114,27 +114,64 @@ jobs:
           ls -l packages/
           cp packages/*.deb out/vpntint-roothide.deb
 
-      - name: 修 arm64e ptrauth ABI 标志（必须早于所有产物校验）
+      - name: 确认切片策略（1.0.4 起只发 arm64 单切片）
         run: |
           set -e
-          LDID="$THEOS/toolchain/linux/iphone/bin/ldid"
-          [ -x "$LDID" ] || LDID="$THEOS/bin/ldid"
-          [ -x "$LDID" ] || LDID="$(command -v ldid || true)"
-          echo "ldid = $LDID"
-          [ -n "$LDID" ] && [ -x "$LDID" ] || { echo "FAIL: 找不到 ldid"; exit 1; }
+          # 为什么不再「修 arm64e ABI」：
+          #   CI 日志里链接器自己就警告
+          #     ld: warning: object file ...o was built with an incompatible
+          #                 arm64e ABI compiler
+          #   说明编译器产出的机器码本身就是老 ABI。此时补 caps=0x80 只是把
+          #   标签改成新 ABI，代码里却没有对应的 ptrauth 签名指令 —— 那是
+          #   用改元数据掩盖 ABI 不匹配，崩起来比现在更隐蔽。
+          #   正确做法是根本不产生 arm64e 切片：arm64e 设备上 dyld 走 arm64
+          #   兼容加载路径，整条 ptrauth 路径都不经过。
+          #
+          # 这一步骤的作用是**证明**产物确实只有 arm64，而不是以为它只有。
+          for f in out/*.deb; do
+            echo "==================== $f"
+            rm -rf /tmp/x && mkdir -p /tmp/x
+            dpkg-deb -x "$f" /tmp/x
+            dylib=$(find /tmp/x -name 'VpnTint.dylib' | head -1)
+            echo "dylib: $dylib"
+            # 默认判据就是「arm64 必须有、arm64e 不允许存在（若存在必须合规）」
+            python3 tools/check_arch.py "$dylib"
+            # 再显式断言没有 arm64e 切片，防止 check_arch 未来放宽后静默放过
+            # 注意：ARCHS=arm64 时 theos 不一定产 fat —— 也可能是 thin 单切片，
+            # 所以这里必须两种都认，否则会在正常产物上误报「不是 fat 文件」。
+            python3 - "$dylib" <<'PY'
+import struct, sys
+p = sys.argv[1]
+d = open(p, "rb").read()
+magic_be = struct.unpack(">I", d[:4])[0]
+magic_le = struct.unpack("<I", d[:4])[0]
+subs = []
+if magic_be in (0xCAFEBABE, 0xCAFEBABF):        # fat
+    n = struct.unpack(">I", d[4:8])[0]
+    off = 8
+    for _ in range(n):
+        if magic_be == 0xCAFEBABE:
+            cpu, sub = struct.unpack(">iI", d[off:off + 8]); off += 20
+        else:
+            cpu, sub = struct.unpack(">iI", d[off:off + 8]); off += 32
+        subs.append((cpu & 0xFFFFFFFF, sub & 0x00FFFFFF, (sub >> 24) & 0xFF))
+elif magic_le == 0xFEEDFACF:                     # thin mach-o 64
+    cpu, sub = struct.unpack("<iI", d[4:12])
+    subs.append((cpu & 0xFFFFFFFF, sub & 0x00FFFFFF, (sub >> 24) & 0xFF))
+else:
+    raise SystemExit("既不是 fat 也不是 Mach-O 64：magic=%08x" % magic_be)
+print("   切片:", subs)
+assert any(c == 0x0100000C and e == 0 for c, e, _ in subs), "缺 arm64 切片"
+bad = [(c, e, cp) for c, e, cp in subs if c == 0x0100000C and e == 2 and not (cp & 0x80)]
+assert not bad, "存在老 ABI 的 arm64e 切片: %r" % (bad,)
+n_e = sum(1 for c, e, _ in subs if c == 0x0100000C and e == 2)
+print("   OK：arm64 存在，arm64e 切片数=%d（0 = 1.0.4 的预期形态）" % n_e)
+PY
+          done
 
-          # 先证明「这条修复真的会动手」：修之前必须被判缺标志。
-          # 没有这一步，下面「修完通过」可能只是因为本来就没缺陷。
-          if python3 tools/fix_deb_abi.py out/vpntint-roothide.deb --check-only; then
-            echo "注意：arm64e 本来就带 PTRAUTH_ABI，本步将 no-op"
-          else
-            echo "OK: 确认修前缺 CPU_SUBTYPE_PTRAUTH_ABI，开始修"
-          fi
-
-          # 补 caps 会改字节，页哈希立刻失效，所以这里必然重签。
-          python3 tools/fix_deb_abi.py out/vpntint-roothide.deb --ldid "$LDID"
-
-          # 复核：两个包的所有 dylib 签名都必须覆盖当前字节
+      - name: 复核代码签名（补字节后必须重签，这里确认签名覆盖当前字节）
+        run: |
+          set -e
           for f in out/*.deb; do
             python3 tools/check_codesign.py "$f" || { echo "FAIL: $f 签名无效"; exit 1; }
           done
@@ -201,7 +238,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         with:
           tag_name: v1.0.4
-          name: VpnTint 1.0.4（修 arm64e 老式 ABI + 日志真正可写）
+          name: VpnTint 1.0.4（改发 arm64 单切片，绕开 arm64e 老 ABI + 日志真正可写）
           body: |
             **请先卸载旧版（1.0.2 / 1.0.3），再装 1.0.4。** 装完手动 respring。
 
@@ -211,21 +248,33 @@ jobs:
 
             1.0.3 装完仍然进安全模式、而且**找不到 `VpnTint.log`、也没有新的
             `SpringBoard-*.ips`**。这三件事同时成立，指向的不是运行时崩溃，
-            而是**加载期就被拒**。这次把静态层查干净，找到两个具体缺陷：
+            而是**加载期就被拒**。这次把静态层查干净，找到两个具体缺陷。
 
-            ### 1. arm64e 切片用的是老式 ABI（头号嫌疑）
+            ### 1. arm64e 切片是老 ABI —— 改法是不发 arm64e
 
             实测 1.0.3 的 arm64e 切片 `cpusubtype = 0x00000002`，
-            即高 8 位 caps = `0x00` —— 缺 `CPU_SUBTYPE_PTRAUTH_ABI(0x80)`。
-            这是 iOS 12/13 时代的老 arm64e ABI。LLVM 作者原话：
+            即高 8 位 caps = `0x00` —— 缺 `CPU_SUBTYPE_PTRAUTH_ABI(0x80)`，
+            是 iOS 12/13 时代的老 arm64e ABI。dyld 在 arm64e 进程里会优先挑
+            arm64e 切片，于是加载的就是这一片。这与「装上即进安全模式、零日志、
+            无新 ips」完全吻合。
 
-            > Modern arm64e requires versioned binaries: a binary with 0x00 caps
-            > in cpusubtype is now rejected by the linker and everything after.
+            我一度打算「补上 caps 再重签」，但 CI 日志里链接器自己就说了：
 
-            dyld 在 arm64e 进程里会优先挑 arm64e 切片，于是加载的就是这一片。
-            这与「装上即进安全模式、零日志、无新 ips」完全吻合。
-            1.0.4 在 CI 里补上该标志并**重新签名**（补字节会让页哈希失效，
-            顺序必须是先补后签，已用页面哈希逐页复核）。
+            ```
+            ld: warning: object file ...Tweak.m.17ed827e.o was built with an
+                        incompatible arm64e ABI compiler
+            ```
+
+            即**编译器产出的机器码本身就是老 ABI**，不是头字段漏标。
+            补 caps 不改任何一条指令，只把标签改成「新 ABI」——二进制会声称
+            自己合规而实际按老 ABI 跑，一旦和系统库交换函数指针就验签失败，
+            崩点比现在更晚更隐蔽。这条我放弃了，不拿你的手机去赌。
+
+            **1.0.4 的修法是根本不产生 arm64e 切片（`ARCHS = arm64`）**：
+            arm64e 设备上 dyld 走 arm64 兼容加载路径，整条 ptrauth 路径都不经过。
+            状态栏染色是纯 UI 逻辑，没有性能代价。
+            （`vpntint-roothide.deb` 的 `Architecture: iphoneos-arm64e` 是 dpkg 的
+            安装匹配元数据，和包里二进制的切片无关，arm64 切片照常加载。）
 
             ### 2. 日志路径在 SpringBoard 沙箱里根本不可写
 
