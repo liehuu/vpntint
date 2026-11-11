@@ -128,45 +128,22 @@ jobs:
           #   兼容加载路径，整条 ptrauth 路径都不经过。
           #
           # 这一步骤的作用是**证明**产物确实只有 arm64，而不是以为它只有。
+          #
+          # 注意：判定逻辑放在 tools/check_slices.py 里，不写成内联 heredoc。
+          #   曾把 heredoc 内容顶格写进 run: | 块，YAML 直接解析失败，而
+          #   **失败的 workflow 根本不产生 job**（API 上 total_count=0、
+          #   日志 404），看起来像「CI 挂了」，实际是 YAML 写坏了。
           for f in out/*.deb; do
             echo "==================== $f"
             rm -rf /tmp/x && mkdir -p /tmp/x
             dpkg-deb -x "$f" /tmp/x
             dylib=$(find /tmp/x -name 'VpnTint.dylib' | head -1)
             echo "dylib: $dylib"
-            # 默认判据就是「arm64 必须有、arm64e 不允许存在（若存在必须合规）」
+            # 两套判据都跑：
+            #   check_arch.py   —— 通用架构闸门（arm64 必须有；arm64e 若有必须合规）
+            #   check_slices.py —— 本项目专用，显式断言不存在老 ABI arm64e
             python3 tools/check_arch.py "$dylib"
-            # 再显式断言没有 arm64e 切片，防止 check_arch 未来放宽后静默放过
-            # 注意：ARCHS=arm64 时 theos 不一定产 fat —— 也可能是 thin 单切片，
-            # 所以这里必须两种都认，否则会在正常产物上误报「不是 fat 文件」。
-            python3 - "$dylib" <<'PY'
-import struct, sys
-p = sys.argv[1]
-d = open(p, "rb").read()
-magic_be = struct.unpack(">I", d[:4])[0]
-magic_le = struct.unpack("<I", d[:4])[0]
-subs = []
-if magic_be in (0xCAFEBABE, 0xCAFEBABF):        # fat
-    n = struct.unpack(">I", d[4:8])[0]
-    off = 8
-    for _ in range(n):
-        if magic_be == 0xCAFEBABE:
-            cpu, sub = struct.unpack(">iI", d[off:off + 8]); off += 20
-        else:
-            cpu, sub = struct.unpack(">iI", d[off:off + 8]); off += 32
-        subs.append((cpu & 0xFFFFFFFF, sub & 0x00FFFFFF, (sub >> 24) & 0xFF))
-elif magic_le == 0xFEEDFACF:                     # thin mach-o 64
-    cpu, sub = struct.unpack("<iI", d[4:12])
-    subs.append((cpu & 0xFFFFFFFF, sub & 0x00FFFFFF, (sub >> 24) & 0xFF))
-else:
-    raise SystemExit("既不是 fat 也不是 Mach-O 64：magic=%08x" % magic_be)
-print("   切片:", subs)
-assert any(c == 0x0100000C and e == 0 for c, e, _ in subs), "缺 arm64 切片"
-bad = [(c, e, cp) for c, e, cp in subs if c == 0x0100000C and e == 2 and not (cp & 0x80)]
-assert not bad, "存在老 ABI 的 arm64e 切片: %r" % (bad,)
-n_e = sum(1 for c, e, _ in subs if c == 0x0100000C and e == 2)
-print("   OK：arm64 存在，arm64e 切片数=%d（0 = 1.0.4 的预期形态）" % n_e)
-PY
+            python3 tools/check_slices.py "$dylib"
           done
 
       - name: 复核代码签名（补字节后必须重签，这里确认签名覆盖当前字节）
