@@ -114,6 +114,31 @@ jobs:
           ls -l packages/
           cp packages/*.deb out/vpntint-roothide.deb
 
+      - name: 修 arm64e ptrauth ABI 标志（必须早于所有产物校验）
+        run: |
+          set -e
+          LDID="$THEOS/toolchain/linux/iphone/bin/ldid"
+          [ -x "$LDID" ] || LDID="$THEOS/bin/ldid"
+          [ -x "$LDID" ] || LDID="$(command -v ldid || true)"
+          echo "ldid = $LDID"
+          [ -n "$LDID" ] && [ -x "$LDID" ] || { echo "FAIL: 找不到 ldid"; exit 1; }
+
+          # 先证明「这条修复真的会动手」：修之前必须被判缺标志。
+          # 没有这一步，下面「修完通过」可能只是因为本来就没缺陷。
+          if python3 tools/fix_deb_abi.py out/vpntint-roothide.deb --check-only; then
+            echo "注意：arm64e 本来就带 PTRAUTH_ABI，本步将 no-op"
+          else
+            echo "OK: 确认修前缺 CPU_SUBTYPE_PTRAUTH_ABI，开始修"
+          fi
+
+          # 补 caps 会改字节，页哈希立刻失效，所以这里必然重签。
+          python3 tools/fix_deb_abi.py out/vpntint-roothide.deb --ldid "$LDID"
+
+          # 复核：两个包的所有 dylib 签名都必须覆盖当前字节
+          for f in out/*.deb; do
+            python3 tools/check_codesign.py "$f" || { echo "FAIL: $f 签名无效"; exit 1; }
+          done
+
       - name: 上传编译日志（失败时也要有）
         if: always()
         uses: actions/upload-artifact@v4
@@ -175,51 +200,56 @@ jobs:
       - uses: softprops/action-gh-release@v2
         if: github.event_name == 'workflow_dispatch'
         with:
-          tag_name: v1.0.3
-          name: VpnTint 1.0.3（修复安装后进安全模式：hook 框架递归崩溃）
+          tag_name: v1.0.4
+          name: VpnTint 1.0.4（修 arm64e 老式 ABI + 日志真正可写）
           body: |
-            **请先卸载 v1.0.2。v1.0.2 会让 SpringBoard 崩溃并进入安全模式，不要继续使用。**
+            **请先卸载旧版（1.0.2 / 1.0.3），再装 1.0.4。** 装完手动 respring。
 
             功能不变：VPN 连接时状态栏 Wi-Fi 图标 / 蜂窝信号 / 4G-5G 字样变橙色，断开恢复默认色。
 
-            ## 1.0.3 修的是「装完进安全模式」
+            ## 1.0.4 修的是什么
 
-            这是 SpringBoard 崩溃，不是「没生效」。根因在 1.0.2 的 hook 框架：
+            1.0.3 装完仍然进安全模式、而且**找不到 `VpnTint.log`、也没有新的
+            `SpringBoard-*.ips`**。这三件事同时成立，指向的不是运行时崩溃，
+            而是**加载期就被拒**。这次把静态层查干净，找到两个具体缺陷：
 
-            1. 同一个替换实现被装到「基类 + 全部子类」，而原 IMP 是按
-               `object_getClass(self)` 沿继承链查的。子类的 override 调
-               `[super setActiveColor:]` 时 `self` 仍是子类实例，会查回子类
-               自己的 orig → 无限递归 → 栈溢出 → SpringBoard 崩 → 安全模式。
-               `@try/@catch` 拦不住 `SIGSEGV`。
-            2. `objc_copyClassList` 全量遍历、在 constructor 阶段对大量私有类
-               调 `class_getInstanceMethod`，可能触发 `+initialize`，宿主尚未就绪就崩。
-            3. 补染 / 还原直取 `methodForSelector` 的 IMP，拿到的是替换后的实现，会二次进入 hook。
+            ### 1. arm64e 切片用的是老式 ABI（头号嫌疑）
 
-            1.0.3 的结构性修复：
+            实测 1.0.3 的 arm64e 切片 `cpusubtype = 0x00000002`，
+            即高 8 位 caps = `0x00` —— 缺 `CPU_SUBTYPE_PTRAUTH_ABI(0x80)`。
+            这是 iOS 12/13 时代的老 arm64e ABI。LLVM 作者原话：
 
-            - 每个 `(类, SEL)` 一个独立 trampoline，原 IMP 精确绑到自己的槽位；
-              调回原实现只从槽位取 `orig`，**绝不按 `self` 的类查表**。
-            - 记录与替换分两阶段：先把所有系统原始 IMP 记完，再统一替换，
-              避免继承关系下把 orig 记成自己的 trampoline。
-            - 只 hook 精确命名的具体类，不做全量类表遍历；基类兜底与具体类互斥。
-            - 初始化从 constructor 延迟到主队列；补染 / 还原改走 `objc_msgSend`。
-            - 递归深度保险；染色逻辑异常时原样透传，绝不吞掉状态栏更新。
+            > Modern arm64e requires versioned binaries: a binary with 0x00 caps
+            > in cpusubtype is now rejected by the linker and everything after.
 
-            ## 装完如果还有问题（不用卸载就能自证）
+            dyld 在 arm64e 进程里会优先挑 arm64e 切片，于是加载的就是这一片。
+            这与「装上即进安全模式、零日志、无新 ips」完全吻合。
+            1.0.4 在 CI 里补上该标志并**重新签名**（补字节会让页哈希失效，
+            顺序必须是先补后签，已用页面哈希逐页复核）。
 
-            在 `/var/mobile/Library/Preferences/com.liehuu.vpntint.plist` 里设 `HookLevel`：
+            ### 2. 日志路径在 SpringBoard 沙箱里根本不可写
 
-            - `0` = 完全不加载框架、不装任何 hook（最安全，用来确认崩溃是否来自本插件）
-            - `1` = 只装数据层（VPN 判定）
-            - `2` = 数据层 + 文字层
-            - `3` = 全部（默认）
+            旧版只往 `/var/mobile/Library/Logs/` 和 `/tmp/` 写，SpringBoard
+            沙箱两个都拒绝，而且写失败是静默的。更糟的是 `NSLog` 兜底被放在
+            「文件是否可用」判断之后 —— 文件写不了，系统日志也一起哑掉。
+            所以「没有日志」这件事，**本身就说明不了插件有没有被加载**。
 
-            改完 respring。启动行会打印 `level=` 与 `hook=` 条数。
+            现在：`NSHomeDirectory()/Documents/VpnTint.log` 优先 + 多候选 +
+            真实试写探针；`NSLog` 提到判断之前；启动打 `[0/7]`…`[7/7]` 分步点。
+            `[0/7]` 只要出现，就证明 dylib 已被加载、constructor 跑过。
 
-            包内**不含任何 maintainer script**（不会打断 dpkg），装完请**手动 respring**。
-            诊断日志：`/var/mobile/Library/Logs/VpnTint.log`。
-            若仍崩溃，请提供 `/var/mobile/Library/Logs/CrashReporter/` 里的 `SpringBoard-*.ips`。
+            ## 装完先做这一件事
 
-            - `vpntint-rootless.deb`：Dopamine / palera1n rootless（有 /var/jb）
-            - `vpntint-roothide.deb`：RootHide / roothide bootstrap（iphoneos-arm64e）
+            装完 respring，然后看 `VpnTint.log`（先在 SpringBoard 的 Documents 下找）：
+
+            - 有 `[0/7]` 但没有 `[7/7]` → 卡在某一步，按最后一条编号定位
+            - 一条都没有 → 根本没被加载，回到注入/签名层（把新 `SpringBoard-*.ips` 发我）
+            - 有 `[7/7]` 但不上色 → 功能层问题，把日志发我
+
+            想在不卸载的前提下排除本插件：在
+            `/var/mobile/Library/Preferences/com.liehuu.vpntint.plist` 设 `HookLevel = 0`，
+            respring，此时连私有框架都不 dlopen。
+
+            包内**不含任何 maintainer script**（不会打断 dpkg）。
+            `vpntint-rootless.deb`：Dopamine / palera1n rootless；`vpntint-roothide.deb`：RootHide / roothide。
           files: out/*.deb

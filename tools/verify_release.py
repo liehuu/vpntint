@@ -14,7 +14,7 @@
 用法:
   verify_release.py <deb> [<deb> ...]          校验
   verify_release.py --selftest <deb>           反向自检（投毒必须被抓到）
-  verify_release.py --version 1.0.3 <deb>      指定期望版本（默认 1.0.3）
+  verify_release.py --version 1.0.4 <deb>      指定期望版本（默认读 control）
 """
 import hashlib
 import io
@@ -29,8 +29,13 @@ import tarfile
 import tempfile
 
 CPU_ARM64 = 0x0100000C
+# arm64e 的 cpusubtype 高 8 位是 capability 字段：
+#   0x80 = CPU_SUBTYPE_PTRAUTH_ABI（versioned binary，iOS 14+ 的现代 ABI）
+#   0x00 = 老式无版本 ABI —— LLVM 作者原话：现代 arm64e 会拒绝
+# theos 的 clang-11 早于 ABI 版本化，产出的 arm64e 天然是 0x00。
+CPU_SUBTYPE_PTRAUTH_ABI = 0x80
 # 期望版本从仓库根的 control 读（单一真源），读不到才退回这个字面量。
-DEFAULT_VERSION = "1.0.3"
+DEFAULT_VERSION = "1.0.4"
 
 
 def version_from_control():
@@ -286,6 +291,29 @@ def _c_arm64e(ctx):
     return ((CPU_ARM64, 2) in got, "存在 arm64e 切片", "缺 arm64e 切片（现有 %r）" % (ctx["slices"],))
 
 
+def _c_arm64e_abi(ctx):
+    """arm64e 切片的 caps 必须含 CPU_SUBTYPE_PTRAUTH_ABI(0x80)。
+
+    ★ 这条是 1.0.3「装了进安全模式 / 完全无日志 / 无新崩溃报告」的头号嫌疑。
+    旧断言只做了 `s & 0x00FFFFFF` 掩码比 subtype —— 那个掩码恰好把 caps 位
+    筛掉了，于是「arm64e 存在」永远为真，而「这个 arm64e 是不是现代 ABI」
+    从来没被检查。等于门禁对着缺陷全绿。
+    """
+    bad = []
+    for c, s in ctx["slices"]:
+        if c == CPU_ARM64 and (s & 0x00FFFFFF) == 2:
+            caps = (s >> 24) & 0xFF
+            if not (caps & CPU_SUBTYPE_PTRAUTH_ABI):
+                bad.append("cpusubtype=0x%08x caps=0x%02x" % (s & 0xFFFFFFFF, caps))
+    if not any((c == CPU_ARM64 and (s & 0x00FFFFFF) == 2) for c, s in ctx["slices"]):
+        return (False, "", "没有 arm64e 切片，无从检查 ABI")
+    if bad:
+        return (False, "",
+                "arm64e 缺 CPU_SUBTYPE_PTRAUTH_ABI(0x80)，老式无版本 ABI，"
+                "现代 arm64e 加载器会拒绝：%s" % "; ".join(bad))
+    return (True, "arm64e 带 ptrauth ABI 标志（caps 含 0x80）", "")
+
+
 def _c_must_have(ctx):
     miss = [s.decode() for s in MUST_HAVE if s not in ctx["dylib"]]
     return (not miss, "hook 目标字符串齐全（%d 项）" % len(MUST_HAVE),
@@ -320,6 +348,7 @@ CHECKS = [
     ("filter-plist", _c_filter_plist),
     ("arm64", _c_arm64),
     ("arm64e", _c_arm64e),
+    ("arm64e-abi", _c_arm64e_abi),
     ("must-have", _c_must_have),
     ("must-not-have", _c_must_not_have),
 ]
@@ -361,6 +390,18 @@ def _poison_drop_arm64e(c):
     c["slices"] = [(s[0], s[1]) for s in c["slices"] if (s[1] & 0x00FFFFFF) != 2]
 
 
+def _poison_arm64e_old_abi(c):
+    """把 arm64e 的 caps 抹成 0x00（模拟老式无版本 ABI）。"""
+    c["slices"] = [(s[0], (s[1] & 0x00FFFFFF)) if (s[1] & 0x00FFFFFF) == 2 else s
+                   for s in c["slices"]]
+
+
+def _poison_arm64e_new_abi(c):
+    """反向：把 caps 补成 0x80，用来验证 arm64e-abi 不是永假断言。"""
+    c["slices"] = [(s[0], (s[1] | 0x80000000)) if (s[1] & 0x00FFFFFF) == 2 else s
+                   for s in c["slices"]]
+
+
 def _poison_rename_stui(c):
     c["dylib"] = c["dylib"].replace(b"STUIStatusBar", b"XTUIStatusBar")
 
@@ -395,6 +436,7 @@ POISONS = [
     ("版本号被改回 1.0.1", "version", _poison_version),
     ("包里混进 postinst", "no-scripts", _poison_postinst),
     ("砍掉 arm64e 切片", "arm64e", _poison_drop_arm64e),
+    ("arm64e 退回老式无版本 ABI（caps=0x00）", "arm64e-abi", _poison_arm64e_old_abi),
     ("STUIStatusBar 改名（hook 目标丢失）", "must-have", _poison_rename_stui),
     ("塞回 _UIStatusBarItemView", "must-not-have", _poison_old_target),
     ("文件位置与 Architecture 不符", "path-prefix", _poison_jb_prefix),
@@ -407,13 +449,17 @@ POISONS = [
 def selftest(base_ctx):
     import copy
     print("=== 反向自检：每条断言都必须能失败 ===")
-    # 先确认基线是干净的，否则「投毒被抓到」可能只是本来就有别的失败
+    # ★ 基线不要求干净。1.0.3 的 arm64e 本来就缺 ptrauth ABI，
+    #   基线一定有一条 FAIL。旧写法「基线不干净就退出」会让整套自检被
+    #   一个真实缺陷短路掉 —— 那等于把最该验的东西跳过了。
     base_fails = run_checks(base_ctx, verbose=False)
     if base_fails:
-        print("FAIL: 基线本身就有失败项，反向自检无意义：")
+        print("基线现有失败项（真实缺陷，不阻断自检）：")
         for cid, m in base_fails:
             print("   ·", cid, m)
-        return 1
+    else:
+        print("基线干净")
+    print()
 
     dead = []
     for desc, want_id, fn in POISONS:
@@ -427,7 +473,18 @@ def selftest(base_ctx):
             print("  FAIL %-34s -> 没有被抓到（实际失败项 %s）" % (desc, ids))
             dead.append(desc)
 
-    # 另一类死断言：无论怎么投毒都不失败。这里抽查「改一个字就必挂」的反向：
+    # 反向的另一半：把 arm64e caps 补成 0x80 后，arm64e-abi 必须**变绿**。
+    # 没有这一步，arm64e-abi 可能是个「永远失败」的断言，同样不算检查。
+    c = copy.deepcopy({k: v for k, v in base_ctx.items()})
+    _poison_arm64e_new_abi(c)
+    ids = [cid for cid, _ in run_checks(c, verbose=False)]
+    if "arm64e-abi" in ids:
+        print("  FAIL %-34s -> 补成 0x80 后仍然报错（永假断言）" % "arm64e caps 补成 0x80")
+        dead.append("arm64e caps 补成 0x80")
+    else:
+        print("  OK   %-34s -> arm64e-abi 变绿" % "arm64e caps 补成 0x80")
+
+    # 另一类死断言：无论怎么投毒都不失败。这里抽查「清空就必挂」的反向：
     # 把 must-have 全删，确保断言不是只看其中一项
     c = copy.deepcopy(base_ctx)
     c["dylib"] = b""
@@ -441,7 +498,7 @@ def selftest(base_ctx):
     if dead:
         print("FAIL: %d 条断言语义失效，自检不通过" % len(dead))
         return 1
-    print("OK：反向自检全部有效（%d 条投毒全部被拦）" % (len(POISONS) + 1))
+    print("OK：反向自检全部有效（%d 条投毒 + 2 条反向全被拦）" % len(POISONS))
     return 0
 
 

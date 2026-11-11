@@ -70,7 +70,7 @@
 
 extern CFDictionaryRef CFNetworkCopySystemProxySettings(void);
 
-#define VT_VERSION   "1.0.3"
+#define VT_VERSION   "1.0.4"
 #define VT_PREF_PATH "/var/mobile/Library/Preferences/com.liehuu.vpntint.plist"
 #define VT_READY_MS  500
 
@@ -242,13 +242,19 @@ static void VTLogInit(void) {
 
 static void VTLog(NSString *fmt, ...) {
     @try {
-        VTLogInit();
-        if (!gLogPath) return;
+        NSString *msg = nil;
         va_list ap;
         va_start(ap, fmt);
-        NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+        msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
         va_end(ap);
-        NSLog(@"VpnTint: %@", msg);   // 系统日志兜底：不依赖任何文件是否可写
+        // ★ 顺序关键：NSLog 必须在「文件是否可用」之前。
+        //   旧写法把它放在 `if (!gLogPath) return;` 之后 —— 一旦文件写不了，
+        //   系统日志也一起哑掉，等于观测手段整体失效（这正是用户反馈
+        //   「找不到 VpnTint.log，也没有别的线索」的直接原因之一）。
+        NSLog(@"VpnTint: %@", msg);
+
+        VTLogInit();
+        if (!gLogPath) return;
         NSDateFormatter *df = [[NSDateFormatter alloc] init];
         df.dateFormat = @"MM-dd HH:mm:ss";
         NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [df stringFromDate:[NSDate date]], msg];
